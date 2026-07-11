@@ -1153,6 +1153,8 @@ export function useRoom(roomId) {
 
   function onWtChunk(from, kind, ts, meta, payload) {
     if (!from) return
+    const p = peers.get(from)
+    if (p) p.rxTransport = 'wt'
     if (kind === WT_KIND.VIDEO) {
       const msg = { type: meta.type || 'delta', ts, data: payload }
       if (meta.config) {
@@ -1242,6 +1244,7 @@ export function useRoom(roomId) {
         rxScreen: 0,
         rxScreenAudio: 0,
         rxScreenFps: 0,
+        rxTransport: '',       // 'wt' | 'socket' | '' — latest observed path
         _rxScrBytes: 0,
         _rxScrAudBytes: 0,
         _rxScrFrames: 0,
@@ -1286,13 +1289,19 @@ export function useRoom(roomId) {
     socket.on('video', (from, msg) => {
       if (from === me.id) return
       const p = peers.get(from)
-      if (p) { p.screenOn = true; p.lastFrameTs = performance.now() }
+      if (p) {
+        p.screenOn = true
+        p.lastFrameTs = performance.now()
+        p.rxTransport = 'socket'
+      }
       if (!activeScreenPeerId.value) activeScreenPeerId.value = from
       handleVideoChunk(from, msg)
     })
     socket.on('need-keyframe', () => { if (me.screenOn) vForceKey = true })
     socket.on('screen-audio', (from, msg) => {
       if (from === me.id) return
+      const p = peers.get(from)
+      if (p) p.rxTransport = 'socket'
       handleScreenAudio(from, msg)
     })
 

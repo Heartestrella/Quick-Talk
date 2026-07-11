@@ -129,7 +129,8 @@ const activeScreenPeer = computed(() => {
     isSelf: false,
     rxScreen: p.rxScreen || 0,
     rxScreenAudio: p.rxScreenAudio || 0,
-    rxScreenFps: p.rxScreenFps || 0
+    rxScreenFps: p.rxScreenFps || 0,
+    rxTransport: p.rxTransport || ''
   } : null
 })
 

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 
 const props = defineProps({
   peer: Object,                       // { id, name, isSelf, rxScreen?, rxScreenAudio?, rxScreenFps? }
@@ -18,6 +18,25 @@ function fmtRate(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB/s'
   return (n / 1024 / 1024).toFixed(2) + ' MB/s'
 }
+
+// For self: which pipe are we sending over. For remote peer: which pipe did
+// the most recent incoming chunk arrive on (peer.rxTransport is set by the
+// socket.io / WT receive handlers respectively).
+const activeTransport = computed(() => {
+  if (props.peer?.isSelf) return props.transport || 'socket'
+  return props.peer?.rxTransport || 'socket'
+})
+const transportTitle = computed(() => {
+  const isSelf = props.peer?.isSelf
+  if (activeTransport.value === 'wt') {
+    return isSelf
+      ? '上行走 UDP (WebTransport) · 屏幕数据不经 socket.io'
+      : '正在通过 UDP 接收 · 走 WebTransport'
+  }
+  return isSelf
+    ? '上行走 TCP (socket.io) · UDP 未开启或已降级'
+    : '正在通过 TCP 接收 · WebTransport 未开启 / 尚未收到 UDP 包'
+})
 
 const videoEl = ref(null)   // used when self
 const canvasEl = ref(null)  // used when remote
@@ -117,14 +136,14 @@ onUnmounted(() => {
             <span>{{ fmtRate(peer.rxScreenAudio) }}</span>
           </span>
         </template>
-        <!-- 当前上行走 UDP (WebTransport) 还是 TCP (socket.io) —— 只对发送方有意义 -->
+
+        <!-- Transport tag: self → 用当前上行传输； remote → 用最近一次收到的包来自哪条 -->
         <span
-          v-if="peer.isSelf"
           class="transport-tag mono"
-          :class="transport === 'wt' ? 'wt' : 'tcp'"
-          :title="transport === 'wt' ? '走 UDP (WebTransport) · 屏幕数据不经 socket.io' : '走 TCP (socket.io) · UDP 未开启或已降级'"
+          :class="activeTransport === 'wt' ? 'wt' : 'tcp'"
+          :title="transportTitle"
         >
-          {{ transport === 'wt' ? 'UDP' : 'TCP' }}
+          {{ activeTransport === 'wt' ? 'UDP' : 'TCP' }}
         </span>
       </span>
       <!-- Full-screen is intentionally disabled while previewing your own
