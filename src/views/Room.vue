@@ -383,6 +383,14 @@ onUnmounted(() => {
         </div>
       </transition>
 
+      <!-- HTTPS / secure-context notice — persistent until fixed -->
+      <div v-if="!room.isSecure" class="disconnect-banner danger secure-banner">
+        <span class="dc-dot danger" aria-hidden="true"></span>
+        <span class="dc-text">
+          此站点不是 HTTPS · 麦克风 / 屏幕共享已被浏览器禁用
+        </span>
+      </div>
+
       <!-- left column -->
       <section class="col left">
         <ScreenView
@@ -646,6 +654,27 @@ onUnmounted(() => {
                     @click="room.screenOptions.codec = c.key"
                   >
                     <span class="mono">{{ c.label }}</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="menu-row">
+                <span class="menu-lbl">声音</span>
+                <div class="chip-group">
+                  <button
+                    class="chip fps"
+                    :class="{ on: !room.screenOptions.shareAudio }"
+                    @click="room.screenOptions.shareAudio = false"
+                  >
+                    <span class="mono">不共享</span>
+                  </button>
+                  <button
+                    class="chip fps"
+                    :class="{ on: room.screenOptions.shareAudio }"
+                    @click="room.screenOptions.shareAudio = true"
+                    :title="'需要在浏览器面板里勾选“共享标签页音频”'"
+                  >
+                    <span class="mono">共享系统 / 标签声音</span>
                   </button>
                 </div>
               </div>
@@ -1228,11 +1257,13 @@ onUnmounted(() => {
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: 14px;
+  gap: 20px 18px;
   align-content: start;
+  padding: 4px 2px;
 }
 .grid.compact {
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(176px, 1fr));
+  gap: 18px 16px;
 }
 
 .empty-seat {

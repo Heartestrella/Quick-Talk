@@ -88,7 +88,7 @@ const initial = computed(() => (props.name || '?').charAt(0).toUpperCase())
   aspect-ratio: 4 / 3;
   min-height: 160px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 40%),
     var(--panel);
@@ -97,6 +97,7 @@ const initial = computed(() => (props.name || '?').charAt(0).toUpperCase())
   transition: border-color 200ms var(--ease), transform 200ms var(--ease), box-shadow 200ms var(--ease);
   display: flex;
   flex-direction: column;
+  box-shadow: 0 4px 14px -8px rgba(0, 0, 0, 0.55), 0 1px 0 rgba(255, 255, 255, 0.02) inset;
 }
 .p-tile.self {
   border-color: var(--line-soft);

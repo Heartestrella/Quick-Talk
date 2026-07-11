@@ -63,12 +63,36 @@ npm run dev
 生产环境：**同一个 Node 进程同时提供前端静态资源 + Socket.IO 中转**，
 只需要暴露一个端口。
 
+### ⚠ 关于 HTTPS（**非常重要**）
+
+麦克风、屏幕共享、WebCodecs 全部要求 **Secure Context** —— 也就是 HTTPS
+（`localhost` 是唯一豁免）。**只要你通过 `http://<IP>` 或 `http://<域名>`
+访问，浏览器会静默地把 `VideoEncoder` / `MediaStreamTrackProcessor` /
+`navigator.mediaDevices` 设成 undefined**，前端会看到"当前站点不是 HTTPS"
+的红条以及"屏幕共享 API 被禁用"的提示。
+
+三种搭 HTTPS 的方式，任选一种：
+
+**A. 反向代理接管 TLS（生产推荐）** —— 见下面的 Nginx / Caddy 配置
+
+**B. Node 直接开 HTTPS**（快速测试，无反代）
+```bash
+# 让 Let's Encrypt 或 mkcert 给你一份证书
+SSL_CERT=/path/to/fullchain.pem SSL_KEY=/path/to/privkey.pem PORT=443 npm start
+```
+
+**C. 内网 / 临时自签**（不适合公网）
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj "/CN=$(hostname -I | awk '{print $1}')"
+SSL_CERT=./cert.pem SSL_KEY=./key.pem npm start
+```
+手机首次访问会警告"不安全"，选"继续访问"就能用。
+
 ### 前置
 
 - Node.js **≥ 18**
 - 端口：默认 `3001`（可通过 `PORT` 环境变量覆盖）
-- HTTPS 必须（Chrome / Safari 移动端要求 `getUserMedia` / `getDisplayMedia` 走
-  HTTPS）。生产建议在 **前面挂一个反向代理终止 TLS**（Nginx / Caddy / Cloudflare 均可）。
 
 ### 方案 A：服务器上直接构建（推荐）
 
@@ -148,10 +172,12 @@ talk.example.com {
 
 ### 环境变量
 
-| 变量       | 默认       | 说明                    |
-| ---------- | ---------- | ----------------------- |
-| `PORT`     | `3001`     | Node 服务监听端口       |
-| `HOST`     | `0.0.0.0`  | 绑定网卡                |
+| 变量        | 默认      | 说明                                                  |
+| ----------- | --------- | ----------------------------------------------------- |
+| `PORT`      | `3001`    | Node 服务监听端口                                     |
+| `HOST`      | `0.0.0.0` | 绑定网卡                                              |
+| `SSL_CERT`  | *(空)*    | TLS 证书路径 —— 与 `SSL_KEY` 都设置时启动 HTTPS      |
+| `SSL_KEY`   | *(空)*    | TLS 私钥路径                                          |
 
 ### 健康检查
 

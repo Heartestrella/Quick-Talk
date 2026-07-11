@@ -47,8 +47,20 @@ export function useRoom(roomId) {
     resolution: '1080p',    // '720p' | '1080p' | '1440p' | '4k' | 'source'
     frameRate: 30,          // fps
     bitrate: 3.0,           // Mbps target (0.5 – 12)
-    codec: 'auto'           // 'auto' picks the best available (VP9 > H264 > VP8)
+    codec: 'auto',          // 'auto' picks the best available (VP9 > H264 > VP8)
+    shareAudio: false       // ask the browser to include tab / system audio
   })
+
+  // Whether this browser can encode audio (needed to send shared tab audio).
+  // Playback (AudioDecoder) support is a separate feature check on the viewer.
+  const HAS_AUDIO_ENCODER =
+    typeof window !== 'undefined' &&
+    typeof window.AudioEncoder !== 'undefined' &&
+    typeof window.MediaStreamTrackProcessor !== 'undefined'
+  const HAS_AUDIO_DECODER =
+    typeof window !== 'undefined' &&
+    typeof window.AudioDecoder !== 'undefined' &&
+    typeof window.EncodedAudioChunk !== 'undefined'
 
   const codecInfo = ref('')  // reactive info string shown in UI, e.g. "VP9 · 2.8 Mbps"
 
@@ -61,19 +73,40 @@ export function useRoom(roomId) {
   let captureNode = null              // AudioWorkletNode running pcm-worklet.js
   const nextPlayAt = new Map()        // peerId -> AudioContext currentTime for next chunk
   const remoteGains = new Map()       // peerId -> GainNode (per-peer volume + analyser hook)
+  // audioWorklet.addModule() must run once per AudioContext before we can
+  // construct AudioWorkletNode. Two paths create the context: enabling the
+  // mic (ensureAudioCtx) and receiving remote voice (playPcm). If a peer
+  // talked first, playPcm creates the ctx with no worklet loaded, and the
+  // next time we try to open the mic, `new AudioWorkletNode(...)` throws.
+  // Cache the addModule promise so any path can await it, and it only runs
+  // once per successful load.
+  let workletReady = null
 
-  async function ensureAudioCtx() {
-    if (audioCtx) {
-      if (audioCtx.state === 'suspended') { try { await audioCtx.resume() } catch {} }
-      return audioCtx
-    }
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE })
-    try {
-      await audioCtx.audioWorklet.addModule('/pcm-worklet.js')
-    } catch (e) {
-      console.warn('audio worklet load failed', e)
+  function ensureAudioCtxSync() {
+    if (!audioCtx) {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE })
     }
     return audioCtx
+  }
+
+  async function ensureAudioCtx() {
+    ensureAudioCtxSync()
+    if (audioCtx.state === 'suspended') { try { await audioCtx.resume() } catch {} }
+    return audioCtx
+  }
+
+  async function ensureWorklet() {
+    await ensureAudioCtx()
+    if (!workletReady) {
+      workletReady = audioCtx.audioWorklet.addModule('/pcm-worklet.js').catch((e) => {
+        console.warn('audio worklet load failed', e)
+        // Reset so a later toggleMic attempt can retry — otherwise a transient
+        // network hiccup on the very first mic open bricks the mic forever.
+        workletReady = null
+        throw e
+      })
+    }
+    return workletReady
   }
 
   function buildDenoise(rawStream) {
@@ -175,8 +208,21 @@ export function useRoom(roomId) {
   // ---------- microphone: capture PCM and send ----------
   async function toggleMic() {
     if (me.micOn) return stopMic()
+    if (!IS_SECURE) {
+      errorMsg.value = '当前站点不是 HTTPS · 浏览器已禁用麦克风 API · 请通过 https://… 访问'
+      setTimeout(() => (errorMsg.value = ''), 6000)
+      return
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      errorMsg.value = '此浏览器不支持 getUserMedia'
+      setTimeout(() => (errorMsg.value = ''), 4000)
+      return
+    }
     try {
-      await ensureAudioCtx()
+      // Must load the pcm-worklet before constructing the AudioWorkletNode
+      // below. If a remote voice already spun up the audioCtx via playPcm,
+      // the worklet was never loaded — ensureWorklet plugs that gap.
+      await ensureWorklet()
       const raw = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -226,10 +272,10 @@ export function useRoom(roomId) {
 
   // ---------- audio playback (per-peer scheduled queue) ----------
   function playPcm(from, arrayBuf) {
-    if (!audioCtx) {
-      // create a playback-only context so listeners without mic still hear us
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE })
-    }
+    // Playback doesn't need the worklet, so we use the sync ctor here — but
+    // note that if the user later opens their mic, ensureWorklet() will
+    // lazily load the pcm-worklet script into the same context.
+    if (!audioCtx) ensureAudioCtxSync()
     if (audioCtx.state === 'suspended') {
       audioCtx.resume().catch(() => { needsAudioUnlock.value = true })
     }
@@ -269,11 +315,17 @@ export function useRoom(roomId) {
     '4k':    { width: 3840, height: 2160 },
     'source': null
   }
+  // WebCodecs + getDisplayMedia + getUserMedia are all gated behind Secure
+  // Context (HTTPS, or localhost). Over plain http://<lan-ip> or http://<domain>
+  // every relevant API becomes `undefined` and the user sees a "browser not
+  // supported" error that isn't actually about the browser. Track this
+  // separately so we can surface a specific message.
+  const IS_SECURE = typeof window !== 'undefined' && window.isSecureContext === true
   // Encoding requires the full pipeline (encoder + reader + decoder for probing);
   // viewing only needs VideoDecoder. Splitting these means phones that lack
   // MediaStreamTrackProcessor can still receive & display a screen share.
   const HAS_ENCODER =
-    typeof window !== 'undefined' &&
+    IS_SECURE &&
     typeof window.VideoEncoder !== 'undefined' &&
     typeof window.VideoDecoder !== 'undefined' &&
     typeof window.MediaStreamTrackProcessor !== 'undefined'
@@ -286,6 +338,16 @@ export function useRoom(roomId) {
   let vEncoder = null
   let vReader = null
   let vTrackProcessor = null
+  let vEncoderTrack = null   // clone() of the display track — the encoder drains
+                             // this one so backpressure never starves the local
+                             // <video> preview that reads the original stream.
+  // ---- screen audio (system / tab sound capture, when the user opts in) ----
+  let aEncoder = null
+  let aReader = null
+  let aTrackProcessor = null
+  let aTrack = null          // the audio track we pulled off screenStream
+  let aSampleRate = 48000
+  let aChannels = 2
   let vFrameCount = 0
   let vForceKey = true
   let vBitrateBps = 3_000_000
@@ -361,8 +423,13 @@ export function useRoom(roomId) {
   async function toggleScreen() {
     if (me.screenOn) return stopScreen()
     if (!HAS_ENCODER) {
-      errorMsg.value = '当前设备无法作为共享端 · 请用桌面版 Chrome / Edge / Safari 16.4+'
-      setTimeout(() => (errorMsg.value = ''), 5000)
+      // Distinguish "server serves HTTP so the API is disabled" from
+      // "browser genuinely doesn't have WebCodecs". The former is by far the
+      // most common cause once the app leaves localhost.
+      errorMsg.value = !IS_SECURE
+        ? '当前站点不是 HTTPS · 浏览器已禁用屏幕共享 API · 请通过 https://… 访问'
+        : '当前浏览器不支持屏幕共享 · 请用桌面版 Chrome / Edge / Safari 16.4+'
+      setTimeout(() => (errorMsg.value = ''), 6000)
       return
     }
     try {
@@ -372,7 +439,17 @@ export function useRoom(roomId) {
         constraints.width = { ideal: res.width, max: res.width }
         constraints.height = { ideal: res.height, max: res.height }
       }
-      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: constraints, audio: false })
+      // Only ask for audio if the user turned the option on AND this browser
+      // has AudioEncoder (Chromium 94+). If we asked without the ability to
+      // encode, the browser's picker would show a "共享音频" checkbox we
+      // couldn't actually use.
+      const wantAudio = screenOptions.shareAudio && HAS_AUDIO_ENCODER
+      screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: constraints,
+        audio: wantAudio
+          ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+          : false
+      })
       const track = screenStream.getVideoTracks()[0]
       track.addEventListener('ended', stopScreen)
 
@@ -450,7 +527,10 @@ export function useRoom(roomId) {
         width, height,
         bitrate: vBitrateBps,
         framerate: fps,
-        bitrateMode: 'variable',
+        // constant bitrate — the encoder smears bits across frames instead of
+        // spiking a fat keyframe every N frames, which is what was showing up
+        // as periodic stutter for the user (and local self-view).
+        bitrateMode: 'constant',
         ...chosen.opts   // whichever hw/latency combo actually passed the probe
       }
       vEncoder.configure(encoderConfig)
@@ -464,9 +544,29 @@ export function useRoom(roomId) {
       activeScreenPeerId.value = 'me'
       broadcastState()
 
-      vTrackProcessor = new MediaStreamTrackProcessor({ track })
+      // Clone the display track for the encoder — the original still powers
+      // the local <video> preview. Without this, encoder backpressure and the
+      // GPU cost of emitting each keyframe periodically starves the preview,
+      // which is what showed up as "隔几秒卡顿一下".
+      vEncoderTrack = track.clone()
+      vTrackProcessor = new MediaStreamTrackProcessor({ track: vEncoderTrack })
       vReader = vTrackProcessor.readable.getReader()
       pumpFrames().catch((e) => console.warn('pump ended', e))
+
+      // If the user asked for audio AND the browser handed us a track, spin up
+      // the audio encoder. Users can decline the checkbox in the picker, in
+      // which case getAudioTracks() is empty — silently fall through.
+      if (wantAudio) {
+        const at = screenStream.getAudioTracks()[0]
+        if (at) startScreenAudio(at)
+        else if (screenOptions.shareAudio) {
+          errorMsg.value = '你没有勾选浏览器面板里的"共享音频" · 屏幕已在共享，但没有声音'
+          setTimeout(() => (errorMsg.value = ''), 5000)
+        }
+      } else if (screenOptions.shareAudio && !HAS_AUDIO_ENCODER) {
+        errorMsg.value = '当前浏览器不支持共享音频编码 · 屏幕已在共享'
+        setTimeout(() => (errorMsg.value = ''), 5000)
+      }
     } catch (err) {
       console.warn(err)
       errorMsg.value = '屏幕共享失败 · ' + (err?.message || '权限被拒绝')
@@ -476,8 +576,11 @@ export function useRoom(roomId) {
   }
 
   async function pumpFrames() {
-    // Force a keyframe roughly every 4 seconds so recovery is bounded.
-    const KEY_EVERY = 120
+    // Natural keyframe cadence is intentionally slack — every ~20 s at 30 fps.
+    // Late joiners and codec-swap requests already trigger explicit keyframes
+    // via `need-keyframe`, so we don't need a tight 4-second beat. The old
+    // 120-frame cadence was showing up as a visible stutter every few seconds.
+    const KEY_EVERY = 600
     while (vEncoder && vEncoder.state === 'configured' && vReader) {
       const { value: frame, done } = await vReader.read()
       if (done) break
@@ -490,13 +593,85 @@ export function useRoom(roomId) {
     }
   }
 
+  // ---------- screen audio: Opus encode captured tab/system sound ----------
+  async function startScreenAudio(track) {
+    aTrack = track
+    const settings = track.getSettings?.() || {}
+    aSampleRate = settings.sampleRate || 48000
+    aChannels = Math.min(2, settings.channelCount || 2)
+    const opusBitrate = 128_000
+    try {
+      const cfg = {
+        codec: 'opus',
+        sampleRate: aSampleRate,
+        numberOfChannels: aChannels,
+        bitrate: opusBitrate
+      }
+      const probe = await AudioEncoder.isConfigSupported(cfg)
+      if (!probe?.supported) {
+        console.warn('opus config not supported', cfg)
+        stopScreenAudio()
+        return
+      }
+      aEncoder = new AudioEncoder({
+        output: (chunk, meta) => {
+          if (!socket?.connected) return
+          const buf = new ArrayBuffer(chunk.byteLength)
+          chunk.copyTo(buf)
+          const msg = {
+            type: chunk.type,
+            ts: chunk.timestamp,
+            data: buf,
+            sampleRate: aSampleRate,
+            channels: aChannels
+          }
+          if (meta?.decoderConfig?.description) {
+            msg.description = cloneArrayBuffer(meta.decoderConfig.description)
+          }
+          socket.emit('screen-audio', msg)
+        },
+        error: (e) => { console.warn('audio encoder', e); stopScreenAudio() }
+      })
+      aEncoder.configure(probe.config)
+    } catch (e) {
+      console.warn('audio encoder setup failed', e)
+      stopScreenAudio()
+      return
+    }
+
+    aTrackProcessor = new MediaStreamTrackProcessor({ track })
+    aReader = aTrackProcessor.readable.getReader()
+    pumpAudioFrames().catch((e) => console.warn('audio pump ended', e))
+  }
+
+  async function pumpAudioFrames() {
+    while (aEncoder && aEncoder.state === 'configured' && aReader) {
+      const { value: frame, done } = await aReader.read()
+      if (done) break
+      if (!aEncoder || aEncoder.state !== 'configured') { frame.close(); break }
+      try { aEncoder.encode(frame) } catch (e) { console.warn('audio encode', e) }
+      frame.close()
+    }
+  }
+
+  function stopScreenAudio() {
+    if (aEncoder) { try { aEncoder.close() } catch {}; aEncoder = null }
+    if (aReader) { try { aReader.cancel() } catch {}; aReader = null }
+    aTrackProcessor = null
+    if (aTrack) { try { aTrack.stop() } catch {}; aTrack = null }
+    // Tell viewers to tear down their screen-audio decoders for us.
+    if (socket?.connected) socket.emit('screen-audio', { type: 'end' })
+  }
+
   function stopScreen() {
+    stopScreenAudio()
     if (vEncoder) {
       try { vEncoder.close() } catch {}
       vEncoder = null
     }
     if (vReader) { try { vReader.cancel() } catch {}; vReader = null }
     vTrackProcessor = null
+    if (vEncoderTrack) { try { vEncoderTrack.stop() } catch {}; vEncoderTrack = null }
     if (screenStream) { screenStream.getTracks().forEach((t) => t.stop()); screenStream = null }
     me.screenOn = false
     me.txScreen = 0
@@ -517,7 +692,7 @@ export function useRoom(roomId) {
         height: vEncoder._h,
         bitrate: b,
         framerate: screenOptions.frameRate,
-        bitrateMode: 'variable',
+        bitrateMode: 'constant',
         ...(vEncoder._opts || {})
       })
       vBitrateBps = b
@@ -612,7 +787,7 @@ export function useRoom(roomId) {
         width: w, height: h,
         bitrate: vBitrateBps,
         framerate: fps,
-        bitrateMode: 'variable',
+        bitrateMode: 'constant',
         ...chosen.opts
       })
     } catch (e) {
@@ -636,6 +811,93 @@ export function useRoom(roomId) {
   const videoDecoders = new Map()   // peerId -> VideoDecoder
   const pendingChunks = new Map()   // peerId -> [] chunks buffered while waiting for keyframe/config
   const screenCanvases = new Map()  // peerId -> HTMLCanvasElement
+
+  // per-peer screen-audio decoders + a dedicated playback AudioContext (48 kHz
+  // so we don't downsample). Voice keeps its own 16 kHz context above.
+  const screenAudioDecoders = new Map()  // peerId -> AudioDecoder
+  const screenAudioGains = new Map()     // peerId -> GainNode
+  const screenAudioNext = new Map()      // peerId -> next scheduled play time
+  let screenAudioCtx = null
+  function ensureScreenAudioCtx() {
+    if (!screenAudioCtx) {
+      screenAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 })
+    }
+    if (screenAudioCtx.state === 'suspended') {
+      screenAudioCtx.resume().catch(() => { needsAudioUnlock.value = true })
+    }
+    return screenAudioCtx
+  }
+
+  function handleScreenAudio(from, msg) {
+    if (!HAS_AUDIO_DECODER) return
+    if (!msg || msg.type === 'end') {
+      const dec = screenAudioDecoders.get(from)
+      if (dec) { try { dec.close() } catch {}; screenAudioDecoders.delete(from) }
+      const g = screenAudioGains.get(from)
+      if (g) { try { g.disconnect() } catch {}; screenAudioGains.delete(from) }
+      screenAudioNext.delete(from)
+      return
+    }
+    let dec = screenAudioDecoders.get(from)
+    const ctx = ensureScreenAudioCtx()
+    if (!dec) {
+      let gain = screenAudioGains.get(from)
+      if (!gain) {
+        gain = ctx.createGain()
+        gain.connect(ctx.destination)
+        screenAudioGains.set(from, gain)
+      }
+      dec = new AudioDecoder({
+        output: (data) => {
+          try {
+            const frames = data.numberOfFrames
+            const chans = data.numberOfChannels
+            const sr = data.sampleRate
+            const buffer = ctx.createBuffer(chans, frames, sr)
+            for (let c = 0; c < chans; c++) {
+              const tmp = new Float32Array(frames)
+              data.copyTo(tmp, { planeIndex: c })
+              buffer.copyToChannel(tmp, c)
+            }
+            const src = ctx.createBufferSource()
+            src.buffer = buffer
+            src.connect(gain)
+            const now = ctx.currentTime
+            let t = screenAudioNext.get(from) || 0
+            if (t < now + JITTER_SEC) t = now + JITTER_SEC
+            src.start(t)
+            screenAudioNext.set(from, t + buffer.duration)
+          } catch (e) { console.warn('screen-audio render', e) }
+          data.close()
+        },
+        error: (e) => {
+          console.warn('screen-audio decoder', e)
+          try { dec.close() } catch {}
+          screenAudioDecoders.delete(from)
+        }
+      })
+      try {
+        dec.configure({
+          codec: 'opus',
+          sampleRate: msg.sampleRate || 48000,
+          numberOfChannels: msg.channels || 2,
+          description: msg.description ? new Uint8Array(msg.description) : undefined
+        })
+      } catch (e) {
+        console.warn('screen-audio configure failed', e)
+        return
+      }
+      screenAudioDecoders.set(from, dec)
+    }
+    if (!msg.data) return
+    try {
+      dec.decode(new EncodedAudioChunk({
+        type: msg.type || 'key',
+        timestamp: msg.ts || 0,
+        data: new Uint8Array(msg.data)
+      }))
+    } catch (e) { console.warn('screen-audio decode', e) }
+  }
 
   // Which codec families this device can actually decode. Populated lazily on
   // first video-chunk. Used to (a) skip re-asking for a codec swap we already
@@ -875,6 +1137,10 @@ export function useRoom(roomId) {
       handleVideoChunk(from, msg)
     })
     socket.on('need-keyframe', () => { if (me.screenOn) vForceKey = true })
+    socket.on('screen-audio', (from, msg) => {
+      if (from === me.id) return
+      handleScreenAudio(from, msg)
+    })
     socket.on('need-codec', ({ wanted }) => {
       if (!me.screenOn) return
       const target = typeof wanted === 'string' ? wanted : 'h264'
@@ -904,6 +1170,11 @@ export function useRoom(roomId) {
     if (dec) { try { dec.close() } catch {}; videoDecoders.delete(id) }
     pendingChunks.delete(id)
     screenCanvases.delete(id)
+    const adec = screenAudioDecoders.get(id)
+    if (adec) { try { adec.close() } catch {}; screenAudioDecoders.delete(id) }
+    const ag = screenAudioGains.get(id)
+    if (ag) { try { ag.disconnect() } catch {}; screenAudioGains.delete(id) }
+    screenAudioNext.delete(id)
     if (activeScreenPeerId.value === id) activeScreenPeerId.value = null
   }
 
@@ -930,6 +1201,9 @@ export function useRoom(roomId) {
     if (audioCtx && audioCtx.state === 'suspended') {
       audioCtx.resume().catch(() => {})
     }
+    if (screenAudioCtx && screenAudioCtx.state === 'suspended') {
+      screenAudioCtx.resume().catch(() => {})
+    }
     needsAudioUnlock.value = false
   }
 
@@ -938,6 +1212,10 @@ export function useRoom(roomId) {
     stopScreen()
     for (const id of Array.from(peers.keys())) cleanupPeer(id)
     if (audioCtx) { try { audioCtx.close() } catch {} audioCtx = null }
+    if (screenAudioCtx) { try { screenAudioCtx.close() } catch {} screenAudioCtx = null }
+    // Reset per-context worklet load state so re-entering the room next time
+    // doesn't inherit a promise tied to a closed AudioContext.
+    workletReady = null
     if (socket) { try { socket.disconnect() } catch {} }
   }
 
@@ -967,6 +1245,7 @@ export function useRoom(roomId) {
     codecInfo,
     hasEncoder: HAS_ENCODER,
     hasDecoder: HAS_DECODER,
+    isSecure: IS_SECURE,
     toggleMic,
     toggleScreen,
     toggleDenoise,

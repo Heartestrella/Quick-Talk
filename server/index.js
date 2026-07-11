@@ -7,6 +7,7 @@
 
 import express from 'express'
 import http from 'http'
+import https from 'https'
 import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
@@ -16,8 +17,27 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const distDir = path.join(rootDir, 'dist')
 
+// If SSL_CERT and SSL_KEY point at readable files, serve HTTPS directly —
+// no reverse proxy needed. Required for WebCodecs / getDisplayMedia /
+// getUserMedia to be exposed to the page (secure-context gate).
+const sslCertPath = process.env.SSL_CERT
+const sslKeyPath = process.env.SSL_KEY
+let httpsOptions = null
+if (sslCertPath && sslKeyPath) {
+  try {
+    httpsOptions = {
+      cert: fs.readFileSync(sslCertPath),
+      key: fs.readFileSync(sslKeyPath)
+    }
+  } catch (err) {
+    console.warn(`[quick-talk] SSL cert/key unreadable — falling back to HTTP:`, err.message)
+  }
+}
+
 const app = express()
-const server = http.createServer(app)
+const server = httpsOptions
+  ? https.createServer(httpsOptions, app)
+  : http.createServer(app)
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
   // Screen encoded chunks can hit a few MB at 4K; give ourselves headroom.
@@ -105,6 +125,14 @@ io.on('connection', (socket) => {
     socket.to(currentRoom).emit('need-keyframe')
   })
 
+  // Screen-audio: Opus-encoded EncodedAudioChunk payload from the sharer.
+  //   msg = { type: 'key'|'delta', ts, data: ArrayBuffer, sampleRate, channels,
+  //           description? }  |  { type: 'end' }  when the sharer stops audio
+  socket.on('screen-audio', (msg) => {
+    if (!currentRoom) return
+    socket.to(currentRoom).emit('screen-audio', socket.id, msg)
+  })
+
   // Viewer discovered it can't decode the current codec — ask any active
   // sharer in the room to switch. Payload: { avoid, wanted }.
   socket.on('need-codec', (payload) => {
@@ -162,9 +190,15 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3001
 const HOST = process.env.HOST || '0.0.0.0'
 const servesSpa = fs.existsSync(distDir)
+const scheme = httpsOptions ? 'https' : 'http'
 server.listen(PORT, HOST, () => {
   const role = servesSpa ? 'app + relay' : 'relay only'
-  console.log(`[quick-talk] ${role} on ${HOST}:${PORT}`)
+  console.log(`[quick-talk] ${role} (${scheme}) on ${HOST}:${PORT}`)
+  if (!httpsOptions && HOST !== '127.0.0.1' && HOST !== 'localhost') {
+    console.log('[quick-talk] ⚠  HTTP mode — WebCodecs / getUserMedia will be')
+    console.log('[quick-talk]    disabled by the browser once you leave localhost.')
+    console.log('[quick-talk]    Set SSL_CERT and SSL_KEY, or put HTTPS in front (Caddy/Nginx).')
+  }
   import('os').then(({ networkInterfaces }) => {
     const nets = networkInterfaces()
     const ips = []
@@ -174,14 +208,8 @@ server.listen(PORT, HOST, () => {
       }
     }
     if (ips.length) {
-      // In dev the Vite server is on 5173 with HTTPS. In prod this server
-      // serves the app itself on PORT — assume the reverse-proxy terminates
-      // TLS or point users straight at the port.
-      const devUrl = (ip) => `https://${ip}:5173`
-      const prodUrl = (ip) => `http://${ip}:${PORT}`
-      const line = servesSpa ? prodUrl : devUrl
       console.log('[quick-talk] LAN reachable at:')
-      for (const ip of ips) console.log(`               ${line(ip)}`)
+      for (const ip of ips) console.log(`               ${scheme}://${ip}:${PORT}`)
     }
   }).catch(() => {})
 })
