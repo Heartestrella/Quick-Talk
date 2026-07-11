@@ -123,7 +123,14 @@ const activeScreenPeer = computed(() => {
   if (!id) return null
   if (id === 'me') return { id: 'me', name: room.me.name, isSelf: true }
   const p = room.peers.get(id)
-  return p ? { id: p.id, name: p.name, isSelf: false } : null
+  return p ? {
+    id: p.id,
+    name: p.name,
+    isSelf: false,
+    rxScreen: p.rxScreen || 0,
+    rxScreenAudio: p.rxScreenAudio || 0,
+    rxScreenFps: p.rxScreenFps || 0
+  } : null
 })
 
 async function copyCode() {
@@ -400,6 +407,9 @@ onUnmounted(() => {
           :get-self-stream="room.getSelfScreenStream"
           :decoder-unsupported="room.decoderUnsupported.value"
           :awaiting-codec-switch="room.awaitingCodecSwitch.value"
+          :self-tx-screen="room.me.txScreen"
+          :self-tx-screen-audio="room.me.txScreenAudio || 0"
+          :transport="room.senderTransport.value"
         />
 
         <div class="col-hdr">

@@ -12,6 +12,7 @@ import path from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
 import { Server } from 'socket.io'
+import { setupWebTransport } from './webtransport.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
@@ -73,6 +74,37 @@ if (fs.existsSync(distDir)) {
  */
 const rooms = new Map()
 
+// Optionally spin up a WebTransport relay alongside socket.io. Enabled when
+// WEBTRANSPORT_PORT is set AND we have a TLS cert. Clients auto-detect via a
+// server-issued token during join; if WT is off the frontend silently keeps
+// using socket.io for everything.
+const wtPort = Number(process.env.WEBTRANSPORT_PORT || 0)
+const wtHost = process.env.WEBTRANSPORT_HOST || HOST_default()
+const wtPublicUrl = process.env.WEBTRANSPORT_PUBLIC_URL || null
+function HOST_default() { return process.env.HOST || '0.0.0.0' }
+
+let wt = null
+if (wtPort > 0 && httpsOptions) {
+  try {
+    wt = setupWebTransport(
+      {
+        port: wtPort,
+        host: wtHost,
+        cert: httpsOptions.cert.toString?.() ?? httpsOptions.cert,
+        privKey: httpsOptions.key.toString?.() ?? httpsOptions.key,
+        publicUrl: wtPublicUrl
+      },
+      { io, rooms }
+    )
+    console.log(`[quick-talk] webtransport enabled on udp/${wtPort}`)
+  } catch (e) {
+    console.warn('[quick-talk] webtransport init failed — running socket.io-only:', e.message)
+    wt = null
+  }
+} else if (wtPort > 0) {
+  console.warn('[quick-talk] WEBTRANSPORT_PORT set but no SSL_CERT/SSL_KEY — WT needs TLS')
+}
+
 function serialise(members, exceptId) {
   const list = []
   for (const [id, m] of members) {
@@ -102,6 +134,13 @@ io.on('connection', (socket) => {
       micOn: false,
       screenOn: false
     })
+
+    // If WT is available, hand this peer a token + URL so it can open a
+    // parallel QUIC session for the heavy screen data.
+    if (wt) {
+      const { token, url } = wt.issueToken(socket.id, room)
+      socket.emit('webtransport', { url, token })
+    }
   })
 
   // Voice: PCM Int16 frames (~640 bytes each = 20ms at 16 kHz mono).
@@ -178,6 +217,7 @@ io.on('connection', (socket) => {
   })
 
   socket.on('disconnect', () => {
+    if (wt) wt.dropSocket(socket.id)
     if (!currentRoom) return
     const members = rooms.get(currentRoom)
     if (!members) return

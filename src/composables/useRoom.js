@@ -3,8 +3,9 @@
 // Screen: WebCodecs VP9/VP8/H.264 encoded chunks (delta-frame compressed).
 // Nothing is P2P — every packet passes through the Node.js relay server.
 
-import { reactive, ref, onUnmounted, computed } from 'vue'
+import { reactive, ref, shallowRef, onUnmounted, computed } from 'vue'
 import { io } from 'socket.io-client'
+import { openWebTransport, WT_KIND } from './useTransport.js'
 
 const NAMES = ['NORTH', 'SOUTH', 'EAST', 'WEST', 'ECHO', 'DELTA', 'FOXTROT', 'GOLF', 'HOTEL', 'INDIA', 'JULIET', 'KILO', 'LIMA', 'MIKE']
 function randomHandle() {
@@ -26,8 +27,9 @@ export function useRoom(roomId) {
     level: 0,
     denoiseOn: true,
     gateOpen: false,
-    txAudio: 0,          // bytes/s outbound
-    txScreen: 0
+    txAudio: 0,          // bytes/s outbound — mic PCM
+    txScreen: 0,         // bytes/s outbound — encoded screen video
+    txScreenAudio: 0     // bytes/s outbound — encoded shared tab / system audio (opus)
   })
 
   const peers = reactive(new Map()) // id -> { id, name, level, micOn, screenOn, lastFrameTs }
@@ -42,6 +44,16 @@ export function useRoom(roomId) {
   // "still connecting for the first time" from "we dropped and are reconnecting"
   const hasConnectedOnce = ref(false)
   const reconnectAttempt = ref(0)
+
+  // WebTransport (QUIC) state. When healthy, screen chunks route through WT
+  // instead of socket.io. Falls back to socket.io automatically when unhealthy
+  // (session close, missed heartbeats). See useTransport.js for the details.
+  const wt = shallowRef(null)                // holds the openWebTransport() return obj (or null)
+  const HAS_WEBTRANSPORT = typeof window !== 'undefined' && typeof window.WebTransport !== 'undefined'
+  const senderTransport = computed(() =>
+    (wt.value && wt.value.healthy.value) ? 'wt' : 'socket'
+  )
+  let wtInfo = null                          // { url, token } cached for reconnect
 
   const screenOptions = reactive({
     resolution: '1080p',    // '720p' | '1080p' | '1440p' | '4k' | 'source'
@@ -507,7 +519,7 @@ export function useRoom(roomId) {
                 : null
             }
           }
-          socket.emit('video', msg)
+          sendVideo(msg)
           txBytes += buf.byteLength
           const now = performance.now()
           if (now - txTick > 1000) {
@@ -613,6 +625,8 @@ export function useRoom(roomId) {
         stopScreenAudio()
         return
       }
+      let aTxBytes = 0
+      let aTxTick = performance.now()
       aEncoder = new AudioEncoder({
         output: (chunk, meta) => {
           if (!socket?.connected) return
@@ -628,7 +642,14 @@ export function useRoom(roomId) {
           if (meta?.decoderConfig?.description) {
             msg.description = cloneArrayBuffer(meta.decoderConfig.description)
           }
-          socket.emit('screen-audio', msg)
+          sendScreenAudio(msg)
+          aTxBytes += buf.byteLength
+          const now = performance.now()
+          if (now - aTxTick > 1000) {
+            me.txScreenAudio = Math.round((aTxBytes * 1000) / (now - aTxTick))
+            aTxBytes = 0
+            aTxTick = now
+          }
         },
         error: (e) => { console.warn('audio encoder', e); stopScreenAudio() }
       })
@@ -659,6 +680,7 @@ export function useRoom(roomId) {
     if (aReader) { try { aReader.cancel() } catch {}; aReader = null }
     aTrackProcessor = null
     if (aTrack) { try { aTrack.stop() } catch {}; aTrack = null }
+    me.txScreenAudio = 0
     // Tell viewers to tear down their screen-audio decoders for us.
     if (socket?.connected) socket.emit('screen-audio', { type: 'end' })
   }
@@ -766,7 +788,7 @@ export function useRoom(roomId) {
               : null
           }
         }
-        socket.emit('video', msg)
+        sendVideo(msg)
         txBytes += buf.byteLength
         const now = performance.now()
         if (now - txTick > 1000) {
@@ -830,6 +852,7 @@ export function useRoom(roomId) {
 
   function handleScreenAudio(from, msg) {
     if (!HAS_AUDIO_DECODER) return
+    if (msg?.data?.byteLength) tallyRx(from, msg.data.byteLength, false)
     if (!msg || msg.type === 'end') {
       const dec = screenAudioDecoders.get(from)
       if (dec) { try { dec.close() } catch {}; screenAudioDecoders.delete(from) }
@@ -987,11 +1010,34 @@ export function useRoom(roomId) {
     socket.emit('need-codec', { avoid: family, wanted })
   }
 
+  // Track per-peer receive rate for the screen video + audio streams. Rolling
+  // 1-second window; called from both handleVideoChunk and handleScreenAudio.
+  function tallyRx(from, bytes, isFrame) {
+    const p = peers.get(from)
+    if (!p) return
+    p._rxScrBytes = (p._rxScrBytes || 0) + (isFrame ? bytes : 0)
+    if (!isFrame) p._rxScrAudBytes = (p._rxScrAudBytes || 0) + bytes
+    if (isFrame) p._rxScrFrames = (p._rxScrFrames || 0) + 1
+    const now = performance.now()
+    if (!p._rxScrTick) p._rxScrTick = now
+    const dt = now - p._rxScrTick
+    if (dt >= 1000) {
+      p.rxScreen = Math.round((p._rxScrBytes * 1000) / dt)
+      p.rxScreenAudio = Math.round((p._rxScrAudBytes * 1000) / dt)
+      p.rxScreenFps = Math.round((p._rxScrFrames * 1000) / dt)
+      p._rxScrBytes = 0
+      p._rxScrAudBytes = 0
+      p._rxScrFrames = 0
+      p._rxScrTick = now
+    }
+  }
+
   async function handleVideoChunk(from, msg) {
     if (!HAS_DECODER) {
       if (!decoderUnsupported.value) decoderUnsupported.value = true
       return
     }
+    if (msg?.data?.byteLength) tallyRx(from, msg.data.byteLength, true)
     let dec = videoDecoders.get(from)
     // Config → (re)build decoder
     if (msg.config) {
@@ -1041,6 +1087,100 @@ export function useRoom(roomId) {
   }
 
   // ---------- signaling / room events ----------
+  // ---------- transport routing helpers ----------
+  // If WT is healthy, encode + ship the chunk via QUIC uni-stream. Otherwise
+  // fall back to the existing socket.io path.
+  function bytesToB64(bytes) {
+    if (!bytes) return ''
+    const u8 = bytes instanceof Uint8Array
+      ? bytes
+      : new Uint8Array(bytes)
+    let s = ''
+    // Small binaries (VP9 descriptor is ~50B, Opus header ~20B); simple loop OK.
+    for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i])
+    return btoa(s)
+  }
+  function sendVideo(msg) {
+    if (wt.value?.healthy?.value) {
+      const meta = { type: msg.type }
+      if (msg.config) {
+        meta.config = {
+          codec: msg.config.codec,
+          codedWidth: msg.config.codedWidth,
+          codedHeight: msg.config.codedHeight,
+          description: msg.config.description ? bytesToB64(msg.config.description) : ''
+        }
+      }
+      wt.value.sendChunk(WT_KIND.VIDEO, msg.ts, meta, new Uint8Array(msg.data))
+      return
+    }
+    if (socket?.connected) socket.emit('video', msg)
+  }
+  function sendScreenAudio(msg) {
+    if (wt.value?.healthy?.value) {
+      const meta = {
+        type: msg.type,
+        sampleRate: msg.sampleRate,
+        channels: msg.channels
+      }
+      if (msg.description) meta.description = bytesToB64(msg.description)
+      wt.value.sendChunk(WT_KIND.SCREEN_AUDIO, msg.ts, meta, new Uint8Array(msg.data))
+      return
+    }
+    if (socket?.connected) socket.emit('screen-audio', msg)
+  }
+
+  // ---------- WT open + incoming chunk demux ----------
+  async function tryOpenWebTransport(info) {
+    if (!HAS_WEBTRANSPORT || !info?.url || !info?.token || !me.id) return
+    // Close a stale session before starting a new one.
+    if (wt.value) { try { wt.value.close() } catch {}; wt.value = null }
+    const opened = await openWebTransport({
+      url: info.url,
+      socketId: me.id,
+      token: info.token,
+      room: roomId,
+      onChunk: onWtChunk,
+      onClose: () => { if (wt.value === opened) wt.value = null }
+    })
+    if (opened) {
+      wt.value = opened
+      console.log('[wt] session up')
+    } else {
+      console.log('[wt] open failed — staying on socket.io')
+    }
+  }
+
+  function onWtChunk(from, kind, ts, meta, payload) {
+    if (!from) return
+    if (kind === WT_KIND.VIDEO) {
+      const msg = { type: meta.type || 'delta', ts, data: payload }
+      if (meta.config) {
+        msg.config = {
+          codec: meta.config.codec,
+          codedWidth: meta.config.codedWidth,
+          codedHeight: meta.config.codedHeight,
+          description: meta.config.description
+            ? Uint8Array.from(atob(meta.config.description), (c) => c.charCodeAt(0)).buffer
+            : null
+        }
+      }
+      handleVideoChunk(from, msg)
+    } else if (kind === WT_KIND.SCREEN_AUDIO) {
+      const msg = {
+        type: meta.type || 'key',
+        ts,
+        data: payload,
+        sampleRate: meta.sampleRate || 48000,
+        channels: meta.channels || 2
+      }
+      if (meta.description) {
+        msg.description = Uint8Array.from(atob(meta.description), (c) => c.charCodeAt(0)).buffer
+      }
+      handleScreenAudio(from, msg)
+    }
+  }
+
   function connect() {
     socket = io({
       path: '/socket.io/',
@@ -1076,7 +1216,14 @@ export function useRoom(roomId) {
           level: 0,
           micOn: !!p.micOn,
           screenOn: !!p.screenOn,
-          lastFrameTs: 0
+          lastFrameTs: 0,
+          rxScreen: 0,
+          rxScreenAudio: 0,
+          rxScreenFps: 0,
+          _rxScrBytes: 0,
+          _rxScrAudBytes: 0,
+          _rxScrFrames: 0,
+          _rxScrTick: 0
         })
         if (p.screenOn) sawSharer = true
         if (p.screenOn && !activeScreenPeerId.value) activeScreenPeerId.value = p.id
@@ -1091,7 +1238,14 @@ export function useRoom(roomId) {
       peers.set(id, {
         id, name, level: 0,
         micOn: !!micOn, screenOn: !!screenOn,
-        lastFrameTs: 0
+        lastFrameTs: 0,
+        rxScreen: 0,
+        rxScreenAudio: 0,
+        rxScreenFps: 0,
+        _rxScrBytes: 0,
+        _rxScrAudBytes: 0,
+        _rxScrFrames: 0,
+        _rxScrTick: 0
       })
       // If I'm currently sharing, force a keyframe so this new peer can start decoding
       // rather than waiting up to 4 seconds for the next natural keyframe.
@@ -1140,6 +1294,13 @@ export function useRoom(roomId) {
     socket.on('screen-audio', (from, msg) => {
       if (from === me.id) return
       handleScreenAudio(from, msg)
+    })
+
+    // Server hands us a WT URL + short-lived token right after join, IF it has
+    // a WT relay configured. Missing/absent → we just stay on socket.io.
+    socket.on('webtransport', (info) => {
+      wtInfo = info
+      tryOpenWebTransport(info)
     })
     socket.on('need-codec', ({ wanted }) => {
       if (!me.screenOn) return
@@ -1210,6 +1371,7 @@ export function useRoom(roomId) {
   function leave() {
     stopMic()
     stopScreen()
+    if (wt.value) { try { wt.value.close() } catch {}; wt.value = null }
     for (const id of Array.from(peers.keys())) cleanupPeer(id)
     if (audioCtx) { try { audioCtx.close() } catch {} audioCtx = null }
     if (screenAudioCtx) { try { screenAudioCtx.close() } catch {} screenAudioCtx = null }
@@ -1246,6 +1408,8 @@ export function useRoom(roomId) {
     hasEncoder: HAS_ENCODER,
     hasDecoder: HAS_DECODER,
     isSecure: IS_SECURE,
+    senderTransport,          // 'wt' | 'socket' — reactive
+    hasWebTransport: HAS_WEBTRANSPORT,
     toggleMic,
     toggleScreen,
     toggleDenoise,

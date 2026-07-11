@@ -2,12 +2,22 @@
 import { ref, watch, onMounted, onUnmounted, nextTick } from 'vue'
 
 const props = defineProps({
-  peer: Object,                       // { id, name, isSelf }
+  peer: Object,                       // { id, name, isSelf, rxScreen?, rxScreenAudio?, rxScreenFps? }
   attachCanvas: Function,             // (peerId, canvasEl) for remote screens
   getSelfStream: Function,             // () => MediaStream for local preview
   decoderUnsupported: Boolean,        // viewer's browser can't decode any codec — fatal
-  awaitingCodecSwitch: Boolean        // asked sharer to switch codec, waiting for new keyframe
+  awaitingCodecSwitch: Boolean,       // asked sharer to switch codec, waiting for new keyframe
+  selfTxScreen: { type: Number, default: 0 },       // bytes/s I'm sending out (when peer.isSelf)
+  selfTxScreenAudio: { type: Number, default: 0 },  // bytes/s of shared tab audio (when peer.isSelf)
+  transport: { type: String, default: 'socket' }    // 'wt' | 'socket' — which pipe screen data is on
 })
+
+function fmtRate(n) {
+  if (!n) return '0 B/s'
+  if (n < 1024) return n + ' B/s'
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB/s'
+  return (n / 1024 / 1024).toFixed(2) + ' MB/s'
+}
 
 const videoEl = ref(null)   // used when self
 const canvasEl = ref(null)  // used when remote
@@ -90,7 +100,47 @@ onUnmounted(() => {
         <span class="mono">FROM</span>
         <span class="screen-name">{{ peer.isSelf ? '你' : peer.name }}</span>
       </span>
+      <span class="rx-chips">
+        <span v-if="peer.isSelf" class="rx-chip mono" :title="'当前上行'">
+          <span class="rx-arrow">↑</span>
+          <span>{{ fmtRate(selfTxScreen) }}</span>
+          <span v-if="selfTxScreenAudio > 0" class="rx-sub">+音 {{ fmtRate(selfTxScreenAudio) }}</span>
+        </span>
+        <template v-else>
+          <span class="rx-chip mono" :title="'视频接收速率 · 单位 kbit/s'">
+            <span class="rx-arrow">↓</span>
+            <span>{{ fmtRate(peer.rxScreen) }}</span>
+            <span v-if="peer.rxScreenFps > 0" class="rx-sub">{{ peer.rxScreenFps }} fps</span>
+          </span>
+          <span v-if="peer.rxScreenAudio > 0" class="rx-chip mono rx-audio" :title="'共享音频接收速率'">
+            <span class="rx-arrow">♪</span>
+            <span>{{ fmtRate(peer.rxScreenAudio) }}</span>
+          </span>
+        </template>
+        <!-- 当前上行走 UDP (WebTransport) 还是 TCP (socket.io) —— 只对发送方有意义 -->
+        <span
+          v-if="peer.isSelf"
+          class="transport-tag mono"
+          :class="transport === 'wt' ? 'wt' : 'tcp'"
+          :title="transport === 'wt' ? '走 UDP (WebTransport) · 屏幕数据不经 socket.io' : '走 TCP (socket.io) · UDP 未开启或已降级'"
+        >
+          {{ transport === 'wt' ? 'UDP' : 'TCP' }}
+        </span>
+      </span>
+      <!-- Full-screen is intentionally disabled while previewing your own
+           share: if the user is sharing "entire screen", a full-window <video>
+           mirroring the screen back at itself creates an infinite recursion
+           that instantly freezes the tab (green frame + hang). Viewers of the
+           remote canvas are fine — no recursion possible there. -->
+      <span v-if="peer.isSelf" class="fs-btn disabled" :title="'自己的共享无法全屏 · 会与屏幕捕获形成无限递归'">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9" />
+          <path d="M5.5 5.5l13 13" />
+        </svg>
+        <span class="fs-lbl">自看无法全屏</span>
+      </span>
       <button
+        v-else
         class="fs-btn"
         @click="toggleFullscreen"
         :title="isFullscreen ? '退出全屏' : '全屏显示'"
@@ -182,6 +232,17 @@ onUnmounted(() => {
   border-color: var(--cool);
   background: var(--panel-hi);
 }
+.fs-btn.disabled {
+  color: var(--muted);
+  border-style: dashed;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+.fs-btn.disabled:hover {
+  color: var(--muted);
+  border-color: var(--line);
+  background: var(--panel-2);
+}
 @media (max-width: 520px) {
   .fs-btn .fs-lbl { display: none; }
   .fs-btn { padding: 6px 8px; }
@@ -227,6 +288,66 @@ onUnmounted(() => {
 }
 .screen-owner .mono { color: var(--muted); font-size: 10px; letter-spacing: 0.14em; }
 .screen-name { color: var(--text); font-family: var(--font-mono); letter-spacing: 0.06em; }
+
+.rx-chips {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rx-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 3px 8px;
+  border: 1px solid var(--cool-soft);
+  border-radius: 3px;
+  color: var(--cool);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  background: rgba(74, 141, 168, 0.06);
+}
+.rx-chip.rx-audio {
+  color: var(--signal);
+  border-color: var(--signal-glow);
+  background: rgba(242, 169, 59, 0.06);
+}
+.rx-arrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  opacity: 0.9;
+}
+.rx-sub {
+  color: var(--muted);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  padding-left: 5px;
+  border-left: 1px solid var(--line);
+}
+.transport-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+}
+.transport-tag.wt {
+  color: var(--ok);
+  border-color: rgba(125, 190, 114, 0.35);
+  background: rgba(125, 190, 114, 0.08);
+  box-shadow: 0 0 0 1px rgba(125, 190, 114, 0.15);
+}
+.transport-tag.tcp {
+  color: var(--muted);
+  border-color: var(--line);
+  background: rgba(255, 255, 255, 0.02);
+}
+@media (max-width: 520px) {
+  .rx-chip { padding: 2px 6px; font-size: 10px; }
+  .rx-sub { display: none; }
+  .transport-tag { padding: 2px 6px; font-size: 9px; }
+}
 
 .screen-wrap {
   position: relative;
