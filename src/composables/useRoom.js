@@ -418,6 +418,11 @@ export function useRoom(roomId, opts = {}) {
     const OPEN = 0.032, CLOSE = 0.018, HOLD = 0.28
     let lastLoud = 0, gateOpen = false
     const loop = () => {
+      // stopMic → destroyDenoise races with an in-flight RAF callback:
+      // if the browser had already queued this tick when destroyDenoise ran,
+      // cancelAnimationFrame doesn't stop the queued one. Bail here so
+      // `denoise.raf = requestAnimationFrame(...)` doesn't NPE.
+      if (!denoise) return
       analyser.getByteTimeDomainData(data)
       let sum = 0
       for (let i = 0; i < data.length; i++) {
@@ -613,6 +618,14 @@ export function useRoom(roomId, opts = {}) {
     if (!audioCtx) ensureAudioCtxSync()
     if (audioCtx.state === 'suspended') {
       audioCtx.resume().catch(() => { needsAudioUnlock.value = true })
+      // Still suspended after the resume attempt (mobile before tap) → don't
+      // schedule anything. If we did, nextPlayAt would drift into a far
+      // future while currentTime stays frozen, and post-unlock we'd play a
+      // multi-second echo of stale audio.
+      if (audioCtx.state === 'suspended') {
+        needsAudioUnlock.value = true
+        return
+      }
     }
     const int16 = new Int16Array(arrayBuf)
     // per-peer gain → master gain → destination.  Setting up the master lazily
@@ -644,7 +657,15 @@ export function useRoom(roomId, opts = {}) {
     src.connect(gain)
     const now = audioCtx.currentTime
     let t = nextPlayAt.get(from) || 0
-    if (t < now + JITTER_SEC) t = now + JITTER_SEC   // fresh start (or we fell behind → resync)
+    // Two-way resync:
+    //   too far behind (t in the past)  → nudge to now + JITTER_SEC
+    //   too far ahead (t > now + 0.5 s) → same. Otherwise a suspended
+    //     AudioContext (mobile before user interaction unlocks it) lets
+    //     nextPlayAt accumulate several seconds while audioCtx.currentTime
+    //     stays frozen — after unlock every packet plays that many seconds
+    //     late, which is what shows up as "语音延迟 10 秒".
+    const MAX_QUEUE = 0.5
+    if (t < now + JITTER_SEC || t > now + MAX_QUEUE) t = now + JITTER_SEC
     src.start(t)
     nextPlayAt.set(from, t + buffer.duration)
   }
@@ -1294,7 +1315,8 @@ export function useRoom(roomId, opts = {}) {
             src.connect(gain)
             const now = ctx.currentTime
             let t = screenAudioNext.get(from) || 0
-            if (t < now + JITTER_SEC) t = now + JITTER_SEC
+            // Same two-way resync as voice (see playPcm).
+            if (t < now + JITTER_SEC || t > now + 0.5) t = now + JITTER_SEC
             src.start(t)
             screenAudioNext.set(from, t + buffer.duration)
           } catch (e) { console.warn('screen-audio render', e) }
@@ -1986,6 +2008,12 @@ export function useRoom(roomId, opts = {}) {
     if (screenAudioCtx && screenAudioCtx.state === 'suspended') {
       screenAudioCtx.resume().catch(() => {})
     }
+    // Nuke the accumulated future-schedule so post-unlock frames land at
+    // now + JITTER_SEC instead of "wherever we were when the ctx froze +
+    // however many seconds of buffer we accumulated". Without this, unlock
+    // starts a 5-10 s echo of stale audio.
+    nextPlayAt.clear()
+    screenAudioNext.clear()
     needsAudioUnlock.value = false
   }
 
