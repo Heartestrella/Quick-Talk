@@ -10,6 +10,7 @@ import http from 'http'
 import https from 'https'
 import path from 'path'
 import fs from 'fs'
+import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import { Server } from 'socket.io'
 import { setupWebTransport } from './webtransport.js'
@@ -89,6 +90,65 @@ if (fs.existsSync(distDir)) {
  */
 const rooms = new Map()
 
+// -------------------- room password store --------------------
+// Persist to disk so restarts don't drop passwords. Kept intentionally simple:
+// small file, salted PBKDF2 hash per room (not a security fortress — the point
+// is to keep casual visitors out, not thwart the server operator).
+const roomsFile = path.join(rootDir, 'rooms.json')
+const roomPasswords = new Map()   // roomId -> { salt, hash, createdAt }
+function loadRoomPasswords() {
+  if (!fs.existsSync(roomsFile)) return
+  try {
+    const raw = JSON.parse(fs.readFileSync(roomsFile, 'utf8'))
+    for (const [rid, entry] of Object.entries(raw || {})) {
+      if (entry && typeof entry.hash === 'string' && typeof entry.salt === 'string') {
+        roomPasswords.set(rid, entry)
+      }
+    }
+    console.log(`[quick-talk] loaded ${roomPasswords.size} room passwords`)
+  } catch (err) {
+    console.warn(`[quick-talk] rooms.json parse failed:`, err.message)
+  }
+}
+let saveTimer = null
+function saveRoomPasswords() {
+  // Debounce — many joins in a burst shouldn't fsync every time.
+  if (saveTimer) return
+  saveTimer = setTimeout(() => {
+    saveTimer = null
+    const obj = {}
+    for (const [rid, entry] of roomPasswords) obj[rid] = entry
+    try {
+      fs.writeFileSync(roomsFile + '.tmp', JSON.stringify(obj, null, 2))
+      fs.renameSync(roomsFile + '.tmp', roomsFile)
+    } catch (err) {
+      console.warn('[quick-talk] rooms.json write failed:', err.message)
+    }
+  }, 500)
+}
+function hashPassword(password, salt) {
+  return crypto.pbkdf2Sync(String(password), salt, 60_000, 32, 'sha256').toString('hex')
+}
+function setRoomPassword(roomId, password) {
+  const salt = crypto.randomBytes(12).toString('hex')
+  roomPasswords.set(roomId, {
+    salt,
+    hash: hashPassword(password, salt),
+    createdAt: Date.now()
+  })
+  saveRoomPasswords()
+}
+function verifyRoomPassword(roomId, password) {
+  const entry = roomPasswords.get(roomId)
+  if (!entry) return true                            // no password set → open room
+  if (!password) return false
+  return hashPassword(password, entry.salt) === entry.hash
+}
+function roomHasPassword(roomId) {
+  return roomPasswords.has(roomId)
+}
+loadRoomPasswords()
+
 // Optionally spin up a WebTransport relay alongside socket.io. Enabled when
 // config.webtransport.port > 0 AND we have a TLS cert. Clients auto-detect via
 // a server-issued token during join; if WT is off the frontend silently keeps
@@ -131,9 +191,27 @@ function serialise(members, exceptId) {
 io.on('connection', (socket) => {
   let currentRoom = null
 
-  socket.on('join', ({ room, name }) => {
+  socket.on('join', ({ room, name, password, setPassword }) => {
     room = String(room || '').toUpperCase().slice(0, 12)
     if (!room) return
+
+    // If this join carries a setPassword field AND no password is currently
+    // registered for the room, register it. First-to-arrive semantics — anyone
+    // else asking to join the same room from now on must have this password.
+    if (setPassword && !roomHasPassword(room)) {
+      setRoomPassword(room, String(setPassword))
+    }
+
+    // Password gate. If a password exists for this room, the caller must have
+    // supplied it. Reject with a specific reason so the client can prompt.
+    if (!verifyRoomPassword(room, password)) {
+      socket.emit('auth-required', {
+        room,
+        reason: password ? 'wrong' : 'needed'
+      })
+      return
+    }
+
     currentRoom = room
 
     let members = rooms.get(room)
@@ -141,6 +219,7 @@ io.on('connection', (socket) => {
     members.set(socket.id, { name: name || socket.id.slice(0, 6), micOn: false, screenOn: false })
     socket.join(room)
 
+    socket.emit('joined', { room, hasPassword: roomHasPassword(room) })
     socket.emit('peers', { list: serialise(members, socket.id) })
     socket.to(room).emit('peer-joined', {
       id: socket.id,
@@ -155,6 +234,17 @@ io.on('connection', (socket) => {
       const { token, url } = wt.issueToken(socket.id, room)
       socket.emit('webtransport', { url, token })
     }
+  })
+
+  // Rename mid-room — same shape as join.name, but announced to everyone.
+  socket.on('rename', ({ name }) => {
+    if (!currentRoom) return
+    const members = rooms.get(currentRoom)
+    if (!members?.has(socket.id)) return
+    const clean = String(name || '').slice(0, 24).trim() || socket.id.slice(0, 6)
+    const m = members.get(socket.id)
+    m.name = clean
+    socket.to(currentRoom).emit('peer-renamed', { id: socket.id, name: clean })
   })
 
   // Voice: PCM Int16 frames (~640 bytes each = 20ms at 16 kHz mono).
@@ -193,6 +283,16 @@ io.on('connection', (socket) => {
     if (!payload || typeof payload !== 'object') return
     const wanted = typeof payload.wanted === 'string' ? payload.wanted : 'h264'
     socket.to(currentRoom).emit('need-codec', { wanted })
+  })
+
+  // Sharer reports they can't encode a codec the viewer just asked for.
+  // Broadcast so viewers stop looping-requesting the same codec.
+  socket.on('codec-unavailable', (payload) => {
+    if (!currentRoom) return
+    if (!payload || typeof payload !== 'object') return
+    const codec = typeof payload.codec === 'string' ? payload.codec : null
+    if (!codec) return
+    socket.to(currentRoom).emit('codec-unavailable', { codec })
   })
 
   socket.on('state', ({ micOn, screenOn }) => {

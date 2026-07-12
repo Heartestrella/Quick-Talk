@@ -14,14 +14,65 @@ function randomHandle() {
   return `${w}-${n}`
 }
 
-const SAMPLE_RATE = 16000        // Hz
-const FRAME_SAMPLES = 320        // 20 ms
+const SAMPLE_RATE = 16000        // Hz — WIRE format (Int16 mono @ 16 kHz)
+const FRAME_SAMPLES = 320        // 20 ms on the wire
 const JITTER_SEC = 0.06          // playback lead time to smooth over network jitter
 
-export function useRoom(roomId) {
+// RNNoise runs at 48 kHz and expects exactly 480-sample float32 frames (10 ms).
+// The 48 kHz worklet emits those; main thread runs rnnoise, accumulates 2 frames
+// (960 samples ≈ 20 ms), then decimates 3:1 to produce one 320-sample Int16
+// frame that matches the existing wire format.
+const RNN_SAMPLE_RATE = 48000
+const RNN_FRAME_SAMPLES = 480
+
+// Lazy singleton — one wasm module + rnnoise instance for the whole tab.
+// Every mic session grabs its own DenoiseState off the shared module (cheap).
+// If the wasm 404s or the module errors, `rnnoiseLoad` resolves to null and
+// we transparently fall back to the legacy 16 kHz denoise chain.
+let rnnoiseModulePromise = null
+function loadRnnoise() {
+  if (!rnnoiseModulePromise) {
+    rnnoiseModulePromise = import('@shiguredo/rnnoise-wasm')
+      .then((m) => m.Rnnoise.load())
+      .catch((e) => {
+        console.warn('[rnnoise] load failed — falling back to legacy denoise chain', e)
+        return null
+      })
+  }
+  return rnnoiseModulePromise
+}
+
+// localStorage keys — shared between Landing (writes name), Room (reads name +
+// reads/writes per-room passwords), and here.
+const NAME_KEY = 'qt.name'
+const PWDS_KEY = 'qt.passwords'
+function loadName() {
+  try { return localStorage.getItem(NAME_KEY) || '' } catch { return '' }
+}
+function loadPasswords() {
+  try { return JSON.parse(localStorage.getItem(PWDS_KEY) || '{}') } catch { return {} }
+}
+function savePassword(roomId, pwd) {
+  try {
+    const all = loadPasswords()
+    if (pwd) all[roomId] = pwd
+    else delete all[roomId]
+    localStorage.setItem(PWDS_KEY, JSON.stringify(all))
+  } catch {}
+}
+
+export function useRoom(roomId, opts = {}) {
+  // opts.setPassword: from Landing — this join is a room-creator setting a
+  // password. Passed to the server on the first join; the server registers it
+  // if the room doesn't already have one, then we also cache it locally so we
+  // can auto-rejoin.
+  const initialSetPassword = typeof opts.setPassword === 'string' ? opts.setPassword : null
+
+  const persistedName = loadName()
+
   const me = reactive({
     id: null,
-    name: randomHandle(),
+    name: persistedName || randomHandle(),
     micOn: false,
     screenOn: false,
     level: 0,
@@ -44,6 +95,22 @@ export function useRoom(roomId) {
   // "still connecting for the first time" from "we dropped and are reconnecting"
   const hasConnectedOnce = ref(false)
   const reconnectAttempt = ref(0)
+
+  // Password auth: when the server tells us the room needs a password we've
+  // never supplied (or supplied wrong), Room.vue watches authState to know
+  // whether to show the password prompt.
+  //   state:  'idle' | 'prompting' | 'checking' | 'joined'
+  //   reason: 'needed' | 'wrong' | null
+  const authState = reactive({ state: 'idle', reason: null })
+  // Which password we last tried — if the server accepts us, this is what we
+  // persist into localStorage for auto-rejoin next time.
+  let pendingPassword = (() => {
+    // Prefer freshly-typed (setPassword from Landing) over cached — the two
+    // shouldn't conflict, but "creator intent" wins.
+    if (initialSetPassword) return initialSetPassword
+    const cached = loadPasswords()[roomId]
+    return typeof cached === 'string' ? cached : null
+  })()
 
   // WebTransport (QUIC) state. When healthy, screen chunks route through WT
   // instead of socket.io. Falls back to socket.io automatically when unhealthy
@@ -79,10 +146,18 @@ export function useRoom(roomId) {
   let socket = null
 
   // ---------- audio: shared context, denoise chain, capture worklet ----------
-  let audioCtx = null                 // 16 kHz AudioContext for BOTH capture and playback
+  //   audioCtx      : 16 kHz — remote voice PLAYBACK, and legacy fallback capture
+  //   micCtx        : 48 kHz — mic capture when RNNoise is active. Kept separate
+  //                   because AudioContext's sampleRate is immutable once created
+  //                   and downsampling remote 16 kHz playback into a 48 kHz ctx
+  //                   would be wasteful.
+  let audioCtx = null                 // 16 kHz playback + fallback capture
+  let micCtx = null                   // 48 kHz RNNoise capture (when available)
   let localStream = null              // raw mic MediaStream
   let denoise = null                  // { source, hp, comp, gate, analyser, sink, raf, rewire }
   let captureNode = null              // AudioWorkletNode running pcm-worklet.js
+  let rnn = null                      // { state, remainder, resampleAcc } — active RNNoise session, null if fallback
+  const rnnoiseReady = ref(false)     // becomes true once wasm is loaded and a state is created
   const nextPlayAt = new Map()        // peerId -> AudioContext currentTime for next chunk
   const remoteGains = new Map()       // peerId -> GainNode (per-peer volume + analyser hook)
 
@@ -180,9 +255,8 @@ export function useRoom(roomId) {
   // mic (ensureAudioCtx) and receiving remote voice (playPcm). If a peer
   // talked first, playPcm creates the ctx with no worklet loaded, and the
   // next time we try to open the mic, `new AudioWorkletNode(...)` throws.
-  // Cache the addModule promise so any path can await it, and it only runs
-  // once per successful load.
-  let workletReady = null
+  // Cache the addModule promise per-context so any path can await it.
+  const workletReadyByCtx = new WeakMap()
 
   function ensureAudioCtxSync() {
     if (!audioCtx) {
@@ -197,69 +271,102 @@ export function useRoom(roomId) {
     return audioCtx
   }
 
-  async function ensureWorklet() {
-    await ensureAudioCtx()
-    if (!workletReady) {
-      workletReady = audioCtx.audioWorklet.addModule('/pcm-worklet.js').catch((e) => {
-        console.warn('audio worklet load failed', e)
-        // Reset so a later toggleMic attempt can retry — otherwise a transient
-        // network hiccup on the very first mic open bricks the mic forever.
-        workletReady = null
-        throw e
-      })
+  function ensureMicCtxSync() {
+    if (!micCtx) {
+      micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RNN_SAMPLE_RATE })
     }
-    return workletReady
+    return micCtx
+  }
+  async function ensureMicCtx() {
+    ensureMicCtxSync()
+    if (micCtx.state === 'suspended') { try { await micCtx.resume() } catch {} }
+    return micCtx
   }
 
-  function buildDenoise(rawStream) {
-    const source = audioCtx.createMediaStreamSource(rawStream)
-    const hp = audioCtx.createBiquadFilter()
-    hp.type = 'highpass'
-    hp.frequency.value = 90
+  async function ensureWorkletOn(ctx) {
+    let p = workletReadyByCtx.get(ctx)
+    if (!p) {
+      p = ctx.audioWorklet.addModule('/pcm-worklet.js').catch((e) => {
+        console.warn('audio worklet load failed', e)
+        // Retryable — evict so a later toggleMic can try again.
+        workletReadyByCtx.delete(ctx)
+        throw e
+      })
+      workletReadyByCtx.set(ctx, p)
+    }
+    return p
+  }
 
-    const comp = audioCtx.createDynamicsCompressor()
-    comp.threshold.value = -28
-    comp.knee.value = 12
-    comp.ratio.value = 4
-    comp.attack.value = 0.005
-    comp.release.value = 0.15
+  // Legacy alias — still used by playPcm (which needs a worklet on audioCtx
+  // for the mic path even though playback itself doesn't).
+  async function ensureWorklet() {
+    await ensureAudioCtx()
+    return ensureWorkletOn(audioCtx)
+  }
 
-    const analyser = audioCtx.createAnalyser()
+  // Build the classic denoise chain (highpass → compressor → analyser → gate).
+  // Used when RNNoise isn't available. Wires against whichever context the
+  // caller provides (16 kHz fallback path uses `audioCtx`).
+  //
+  // When RNNoise IS active, we still build a lightweight version of this on
+  // the mic context: only the analyser + gate portion is needed for the level
+  // meter and the "on the wire" mute-when-silent behavior, since RNNoise
+  // already suppresses stationary noise. `mode` selects which:
+  //   'legacy' — full chain (hp, comp, gate)
+  //   'meter'  — analyser only, no gate, no filtering
+  function buildDenoise(rawStream, ctx, mode = 'legacy') {
+    const source = ctx.createMediaStreamSource(rawStream)
+    const analyser = ctx.createAnalyser()
     analyser.fftSize = 512
     analyser.smoothingTimeConstant = 0.65
 
-    const gate = audioCtx.createGain()
-    gate.gain.value = 0
+    // Legacy-mode nodes; unused in 'meter' mode.
+    let hp = null, comp = null, gate = null
+    if (mode === 'legacy') {
+      hp = ctx.createBiquadFilter()
+      hp.type = 'highpass'
+      hp.frequency.value = 90
+      comp = ctx.createDynamicsCompressor()
+      comp.threshold.value = -28
+      comp.knee.value = 12
+      comp.ratio.value = 4
+      comp.attack.value = 0.005
+      comp.release.value = 0.15
+      gate = ctx.createGain()
+      gate.gain.value = 0
+    }
 
-    // The worklet needs a downstream sink to be scheduled; we go to a muted
-    // gain so we never hear ourselves.
-    const sink = audioCtx.createGain()
+    const sink = ctx.createGain()
     sink.gain.value = 0
 
     function rewire(on) {
       try { source.disconnect() } catch {}
-      try { hp.disconnect() } catch {}
-      try { comp.disconnect() } catch {}
+      if (hp) try { hp.disconnect() } catch {}
+      if (comp) try { comp.disconnect() } catch {}
       try { analyser.disconnect() } catch {}
-      try { gate.disconnect() } catch {}
-      if (on) {
-        source.connect(hp)
-        hp.connect(comp)
-        comp.connect(analyser)
-        analyser.connect(gate)
+      if (gate) try { gate.disconnect() } catch {}
+      if (mode === 'legacy') {
+        if (on) {
+          source.connect(hp)
+          hp.connect(comp)
+          comp.connect(analyser)
+          analyser.connect(gate)
+        } else {
+          source.connect(analyser)
+          analyser.connect(gate)
+          gate.gain.setTargetAtTime(1, ctx.currentTime, 0.01)
+        }
+        if (captureNode) gate.connect(captureNode)
+        gate.connect(sink)
       } else {
         source.connect(analyser)
-        analyser.connect(gate)
-        gate.gain.setTargetAtTime(1, audioCtx.currentTime, 0.01)
+        if (captureNode) analyser.connect(captureNode)
+        analyser.connect(sink)
       }
-      // gate always feeds the capture worklet (if present) and the sink
-      if (captureNode) gate.connect(captureNode)
-      gate.connect(sink)
     }
     rewire(me.denoiseOn)
-    sink.connect(audioCtx.destination)
+    sink.connect(ctx.destination)
 
-    // gate control + level metering
     const data = new Uint8Array(analyser.frequencyBinCount)
     const OPEN = 0.032, CLOSE = 0.018, HOLD = 0.28
     let lastLoud = 0, gateOpen = false
@@ -272,18 +379,21 @@ export function useRoom(roomId) {
       }
       const rms = Math.sqrt(sum / data.length)
       me.level = Math.min(1, rms * 3.2)
-      if (me.denoiseOn) {
-        const now = audioCtx.currentTime
+      if (mode === 'legacy' && me.denoiseOn) {
+        const now = ctx.currentTime
         if (rms > OPEN) { gateOpen = true; lastLoud = now }
         else if (rms < CLOSE && now - lastLoud > HOLD) gateOpen = false
         gate.gain.setTargetAtTime(gateOpen ? 1 : 0, now, 0.03)
         me.gateOpen = gateOpen
       } else {
-        me.gateOpen = true
+        // In RNNoise mode the gate lives inside the wasm (via VAD-shaped
+        // output), and there's no analog gate to drive. Just surface a soft
+        // level indicator so the UI still shows the person talking.
+        me.gateOpen = rms > 0.02
       }
       denoise.raf = requestAnimationFrame(loop)
     }
-    denoise = { source, hp, comp, analyser, gate, sink, rewire, raf: null }
+    denoise = { source, hp, comp, analyser, gate, sink, rewire, raf: null, mode }
     denoise.raf = requestAnimationFrame(loop)
     return denoise
   }
@@ -292,10 +402,10 @@ export function useRoom(roomId) {
     if (!denoise) return
     cancelAnimationFrame(denoise.raf)
     try { denoise.source.disconnect() } catch {}
-    try { denoise.hp.disconnect() } catch {}
-    try { denoise.comp.disconnect() } catch {}
+    if (denoise.hp) try { denoise.hp.disconnect() } catch {}
+    if (denoise.comp) try { denoise.comp.disconnect() } catch {}
     try { denoise.analyser.disconnect() } catch {}
-    try { denoise.gate.disconnect() } catch {}
+    if (denoise.gate) try { denoise.gate.disconnect() } catch {}
     try { denoise.sink.disconnect() } catch {}
     denoise = null
     me.level = 0
@@ -305,6 +415,12 @@ export function useRoom(roomId) {
   function toggleDenoise() {
     me.denoiseOn = !me.denoiseOn
     if (denoise) denoise.rewire(me.denoiseOn)
+  }
+
+  function destroyRnn() {
+    if (!rnn) return
+    try { rnn.state.destroy() } catch {}
+    rnn = null
   }
 
   // ---------- microphone: capture PCM and send ----------
@@ -321,39 +437,108 @@ export function useRoom(roomId) {
       return
     }
     try {
-      // Must load the pcm-worklet before constructing the AudioWorkletNode
-      // below. If a remote voice already spun up the audioCtx via playPcm,
-      // the worklet was never loaded — ensureWorklet plugs that gap.
-      await ensureWorklet()
+      // Kick off RNNoise wasm load in parallel with getUserMedia — the first
+      // toggleMic pays the ~200 KB wasm cost, subsequent toggles are instant.
+      const rnnoisePromise = loadRnnoise()
+
+      // Ensure playback context has the worklet loaded too (the mic path
+      // itself uses whichever context ends up capturing).
+      await ensureAudioCtx()
+
       const raw = await navigator.mediaDevices.getUserMedia({
         audio: {
+          // The browser's own echoCancellation / noiseSuppression give us a
+          // cleaner input for RNNoise to work with; leave them on.
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
-          channelCount: 1,
-          sampleRate: SAMPLE_RATE
+          channelCount: 1
         },
         video: false
       })
       localStream = raw
 
-      // Create the capture worklet before the denoise chain so it's ready to be wired in.
-      captureNode = new AudioWorkletNode(audioCtx, 'pcm-capturer')
+      const rnnoiseInstance = await rnnoisePromise
+
       let txBytes = 0
       let txTick = performance.now()
-      captureNode.port.onmessage = (e) => {
-        if (!socket?.connected) return
-        socket.emit('voice', e.data) // ArrayBuffer, 640 bytes
-        txBytes += e.data.byteLength
-        const now = performance.now()
-        if (now - txTick > 1000) {
-          me.txAudio = Math.round((txBytes * 1000) / (now - txTick))
-          txBytes = 0
-          txTick = now
-        }
-      }
 
-      buildDenoise(raw)
+      if (rnnoiseInstance) {
+        // ---------- RNNoise path (48 kHz mic → wasm denoise → 16 kHz Int16 wire) ----------
+        const ctx = await ensureMicCtx()
+        await ensureWorkletOn(ctx)
+
+        const state = rnnoiseInstance.createDenoiseState()
+        // Downsample 3:1 by averaging every 3 samples — cheap and low-aliasing
+        // enough for speech. `remainder` carries samples that didn't fit into
+        // the last outgoing 320-sample block.
+        rnn = {
+          state,
+          out16: new Int16Array(FRAME_SAMPLES),
+          out16Idx: 0,
+          resampleAcc: 0,
+          resampleCount: 0
+        }
+        rnnoiseReady.value = true
+
+        captureNode = new AudioWorkletNode(ctx, 'pcm-capturer', {
+          processorOptions: { frameSize: RNN_FRAME_SAMPLES, format: 'float32' }
+        })
+        captureNode.port.onmessage = (e) => {
+          if (!socket?.connected || !rnn) return
+          const frame = new Float32Array(e.data)   // 480 samples float32 @ 48 kHz
+          // RNNoise expects Int16-range values in a Float32 buffer.
+          for (let i = 0; i < frame.length; i++) frame[i] *= 32768
+          if (me.denoiseOn) {
+            try { rnn.state.processFrame(frame) } catch (err) {
+              console.warn('[rnnoise] processFrame threw', err)
+            }
+          }
+          // Downsample 3:1 → 160 samples per 480 in; two 480-frames per wire packet.
+          for (let i = 0; i < frame.length; i++) {
+            rnn.resampleAcc += frame[i]
+            rnn.resampleCount++
+            if (rnn.resampleCount === 3) {
+              let s = rnn.resampleAcc / 3
+              if (s > 32767) s = 32767
+              else if (s < -32768) s = -32768
+              rnn.out16[rnn.out16Idx++] = s | 0
+              rnn.resampleAcc = 0
+              rnn.resampleCount = 0
+              if (rnn.out16Idx === FRAME_SAMPLES) {
+                const buf = rnn.out16.buffer.slice(0)
+                socket.emit('voice', buf)
+                txBytes += buf.byteLength
+                const now = performance.now()
+                if (now - txTick > 1000) {
+                  me.txAudio = Math.round((txBytes * 1000) / (now - txTick))
+                  txBytes = 0
+                  txTick = now
+                }
+                rnn.out16Idx = 0
+              }
+            }
+          }
+        }
+
+        buildDenoise(raw, ctx, 'meter')
+      } else {
+        // ---------- Legacy 16 kHz path ----------
+        await ensureWorkletOn(ensureAudioCtxSync())
+        captureNode = new AudioWorkletNode(audioCtx, 'pcm-capturer')
+        captureNode.port.onmessage = (e) => {
+          if (!socket?.connected) return
+          socket.emit('voice', e.data) // ArrayBuffer, 640 bytes
+          txBytes += e.data.byteLength
+          const now = performance.now()
+          if (now - txTick > 1000) {
+            me.txAudio = Math.round((txBytes * 1000) / (now - txTick))
+            txBytes = 0
+            txTick = now
+          }
+        }
+        buildDenoise(raw, audioCtx, 'legacy')
+      }
       me.micOn = true
       broadcastState()
     } catch (err) {
@@ -365,6 +550,7 @@ export function useRoom(roomId) {
 
   function stopMic() {
     destroyDenoise()
+    destroyRnn()
     if (captureNode) { try { captureNode.disconnect() } catch {}; captureNode.port.onmessage = null; captureNode = null }
     if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null }
     me.micOn = false
@@ -475,14 +661,20 @@ export function useRoom(roomId) {
     { id: 'av1',  label: 'AV1',   strings: ['av01.0.04M.08'] }
   ]
 
-  async function pickEncoderCodec(width, height, framerate, bitrate) {
+  async function pickEncoderCodec(width, height, framerate, bitrate, { strictFamily = false } = {}) {
     // most encoders require even dimensions
     width = width - (width % 2)
     height = height - (height % 2)
 
     const wanted = screenOptions.codec === 'auto' ? null : screenOptions.codec
-    const ordered = wanted
-      ? [CODEC_CANDIDATES.find((c) => c.id === wanted), ...CODEC_CANDIDATES.filter((c) => c.id !== wanted)].filter(Boolean)
+    const wantedCandidate = wanted ? CODEC_CANDIDATES.find((c) => c.id === wanted) : null
+    // strictFamily: only search inside the requested family. Used by swapCodec —
+    // if the viewer said "I can't decode H.264, please switch to VP8", we must
+    // NOT silently pick H.264 again. Without it, viewers loop-request forever.
+    const ordered = wantedCandidate
+      ? (strictFamily
+          ? [wantedCandidate]
+          : [wantedCandidate, ...CODEC_CANDIDATES.filter((c) => c.id !== wanted)])
       : CODEC_CANDIDATES
 
     // Progressively loosen constraints — some machines reject the strict combo.
@@ -841,12 +1033,18 @@ export function useRoom(roomId) {
     screenOptions.codec = wanted
     let chosen
     try {
-      chosen = await pickEncoderCodec(w, h, fps, vBitrateBps)
+      // strictFamily: viewer said "not this family" — we MUST honor that.
+      // Silently picking the same family (or the family we just moved away from)
+      // is what triggered the "swap codec h264 → vp8 avc1.640028" loop.
+      chosen = await pickEncoderCodec(w, h, fps, vBitrateBps, { strictFamily: true })
     } finally {
       screenOptions.codec = savedPref
     }
     if (!chosen) {
       console.warn('[webcodecs] no encoder available for', wanted, '— staying on', currentFamily)
+      // Tell the viewer we can't produce this codec so they stop asking for it
+      // and cascade to the next candidate (or give up gracefully).
+      if (socket?.connected) socket.emit('codec-unavailable', { codec: wanted })
       return
     }
     console.log('[webcodecs] swap codec', currentFamily, '→', wanted, chosen.string)
@@ -1026,6 +1224,15 @@ export function useRoom(roomId) {
   // first video-chunk. Used to (a) skip re-asking for a codec swap we already
   // know is going to fail, (b) show a helpful message.
   const decoderSupport = { vp9: null, h264: null, vp8: null, av1: null }
+  // Per-family hw/sw preference that probeDecoder found workable — stashed so
+  // makeDecoder can reuse the same opts (probe-passed / configure-throws split
+  // is what put us into an infinite codec-switch loop).
+  const decoderOptsByFamily = { vp9: null, h264: null, vp8: null, av1: null }
+  // Codecs the *sharer* explicitly said they can't encode. Prevents us from
+  // asking for a codec they've already refused. Populated on 'codec-unavailable'.
+  const encoderSupport = { vp9: null, h264: null, vp8: null, av1: null }
+  // Per-family debounce for requestCodecSwitch — bug 3 in the plan file.
+  const lastSwitchRequestAt = new Map()   // family -> performance.now()
   const CODEC_FAMILY = (codec) => {
     if (codec.startsWith('vp09') || codec === 'vp9') return 'vp9'
     if (codec.startsWith('avc1') || codec.startsWith('avc3') || codec === 'h264') return 'h264'
@@ -1034,22 +1241,32 @@ export function useRoom(roomId) {
     return codec
   }
 
+  // Probe a decoder config against a cascade of hw/sw preferences. Returns
+  // { supported, opts } so the caller can configure() with the *same* opts —
+  // otherwise a probe-passed / configure-throws mismatch bounces us back into
+  // requestCodecSwitch (which caused the H.264-High → VP8 codec churn loop).
   async function probeDecoder(cfg) {
-    try {
-      const s = await VideoDecoder.isConfigSupported({
-        codec: cfg.codec,
-        codedWidth: cfg.codedWidth,
-        codedHeight: cfg.codedHeight,
-        description: cfg.description ? new Uint8Array(cfg.description) : undefined,
-        hardwareAcceleration: 'prefer-hardware'
-      })
-      return !!s.supported
-    } catch {
-      return false
+    const attempts = [
+      { hardwareAcceleration: 'prefer-hardware' },
+      { hardwareAcceleration: 'prefer-software' },
+      {}
+    ]
+    for (const opts of attempts) {
+      try {
+        const s = await VideoDecoder.isConfigSupported({
+          codec: cfg.codec,
+          codedWidth: cfg.codedWidth,
+          codedHeight: cfg.codedHeight,
+          description: cfg.description ? new Uint8Array(cfg.description) : undefined,
+          ...opts
+        })
+        if (s.supported) return { supported: true, opts }
+      } catch {}
     }
+    return { supported: false, opts: null }
   }
 
-  function makeDecoder(peerId, cfg) {
+  function makeDecoder(peerId, cfg, opts = {}) {
     const dec = new VideoDecoder({
       output: (frame) => {
         const canvas = screenCanvases.get(peerId)
@@ -1071,13 +1288,16 @@ export function useRoom(roomId) {
         videoDecoders.delete(peerId)
       }
     })
+    // Use the same hw/sw preference that probeDecoder found workable — otherwise
+    // hardcoding 'prefer-hardware' here can reject a config that
+    // isConfigSupported blessed under 'prefer-software'.
     dec.configure({
       codec: cfg.codec,
       codedWidth: cfg.codedWidth,
       codedHeight: cfg.codedHeight,
       description: cfg.description ? new Uint8Array(cfg.description) : undefined,
       optimizeForLatency: true,
-      hardwareAcceleration: 'prefer-hardware'
+      ...(opts || {})
     })
     videoDecoders.set(peerId, dec)
     return dec
@@ -1089,7 +1309,11 @@ export function useRoom(roomId) {
   const CODEC_FALLBACK_ORDER = ['h264', 'vp8', 'av1', 'vp9']
   function pickNextCodecTo(currentFamily) {
     for (const f of CODEC_FALLBACK_ORDER) {
-      if (f !== currentFamily && decoderSupport[f] !== false) return f
+      if (f === currentFamily) continue
+      // Skip families the sharer has told us they can't encode.
+      if (encoderSupport[f] === false) continue
+      if (decoderSupport[f] === false) continue
+      return f
     }
     return null
   }
@@ -1098,6 +1322,14 @@ export function useRoom(roomId) {
     if (!socket?.connected) return
     const family = CODEC_FAMILY(currentCodec)
     decoderSupport[family] = false
+    // Debounce per-family: even after we mark decoderSupport[family]=false,
+    // in-flight chunks with an old config can arrive and re-trigger us. 2 s is
+    // enough to cover a swap round-trip without blocking a genuine re-probe if
+    // the user re-shares from scratch.
+    const now = performance.now()
+    const last = lastSwitchRequestAt.get(family) || 0
+    if (now - last < 2000) return
+    lastSwitchRequestAt.set(family, now)
     const wanted = pickNextCodecTo(family)
     if (!wanted) {
       // We've marked everything as unsupported — surrender.
@@ -1145,14 +1377,16 @@ export function useRoom(roomId) {
       const family = CODEC_FAMILY(msg.config.codec)
       // Probe once per codec family — if unsupported, ask sharer to switch.
       if (decoderSupport[family] === null) {
-        decoderSupport[family] = await probeDecoder(msg.config)
+        const probe = await probeDecoder(msg.config)
+        decoderSupport[family] = probe.supported
+        decoderOptsByFamily[family] = probe.opts
       }
       if (!decoderSupport[family]) {
         requestCodecSwitch(msg.config.codec)
         return
       }
       try {
-        dec = makeDecoder(from, msg.config)
+        dec = makeDecoder(from, msg.config, decoderOptsByFamily[family])
       } catch (e) {
         console.warn('decoder configure failed', msg.config.codec, e)
         decoderSupport[family] = false
@@ -1283,6 +1517,38 @@ export function useRoom(roomId) {
     }
   }
 
+  // Send join with whatever password we currently have (cached, freshly
+  // typed, or none). setPassword is only sent on the initial join by a
+  // room-creator; the server will register it if the room is fresh.
+  function sendJoin() {
+    if (!socket) return
+    const payload = { room: roomId, name: me.name }
+    if (pendingPassword) payload.password = pendingPassword
+    // Only send setPassword on the *very first* join attempt of the session —
+    // don't leak it on reconnects.
+    if (initialSetPassword && authState.state === 'idle') {
+      payload.setPassword = initialSetPassword
+    }
+    if (authState.state === 'prompting') authState.state = 'checking'
+    socket.emit('join', payload)
+  }
+
+  // Called from Room.vue when the user enters a password in the prompt.
+  function submitPassword(pwd) {
+    pendingPassword = String(pwd || '')
+    authState.state = 'checking'
+    sendJoin()
+  }
+
+  // Rename (in-room). Persists locally so the next room reuses the new name.
+  function setName(newName) {
+    const clean = String(newName || '').slice(0, 24).trim()
+    if (!clean || clean === me.name) return
+    me.name = clean
+    try { localStorage.setItem(NAME_KEY, clean) } catch {}
+    if (socket?.connected) socket.emit('rename', { name: clean })
+  }
+
   function connect() {
     socket = io({
       path: '/socket.io/',
@@ -1294,7 +1560,7 @@ export function useRoom(roomId) {
       connection.value = 'connected'
       hasConnectedOnce.value = true
       reconnectAttempt.value = 0
-      socket.emit('join', { room: roomId, name: me.name })
+      sendJoin()
       broadcastState()
     })
     socket.on('disconnect', (reason) => {
@@ -1307,6 +1573,32 @@ export function useRoom(roomId) {
       connection.value = 'reconnecting'
     })
     socket.io.on('reconnect_failed', () => { connection.value = 'offline' })
+
+    // Server accepted the join — persist whichever password made it through so
+    // reload / auto-reconnect skips the prompt.
+    socket.on('joined', ({ hasPassword }) => {
+      authState.state = 'joined'
+      authState.reason = null
+      if (hasPassword && pendingPassword) savePassword(roomId, pendingPassword)
+    })
+
+    // Server rejected the join because the room is password-protected and we
+    // either didn't supply one, or supplied a wrong one. Flip to 'prompting'
+    // and let Room.vue render the input dialog.
+    socket.on('auth-required', ({ reason }) => {
+      // Wrong cached password? Wipe it so the user isn't stuck re-trying it.
+      if (reason === 'wrong' && pendingPassword) {
+        savePassword(roomId, null)
+        pendingPassword = null
+      }
+      authState.state = 'prompting'
+      authState.reason = reason || 'needed'
+    })
+
+    socket.on('peer-renamed', ({ id, name }) => {
+      const p = peers.get(id)
+      if (p) p.name = String(name || '').slice(0, 24)
+    })
 
     socket.on('peers', ({ list }) => {
       let sawSharer = false
@@ -1416,6 +1708,26 @@ export function useRoom(roomId) {
       const target = typeof wanted === 'string' ? wanted : 'h264'
       swapCodec(target).catch((e) => console.warn('swapCodec failed', e))
     })
+    // Sharer told us they can't produce this codec. Mark it so pickNextCodecTo
+    // skips it — otherwise we'd bounce right back with the same request.
+    socket.on('codec-unavailable', ({ codec }) => {
+      if (typeof codec !== 'string') return
+      encoderSupport[codec] = false
+      // If we're currently waiting on a switch that landed here, try the next
+      // candidate now instead of waiting for the next incoming keyframe.
+      if (awaitingCodecSwitch.value) {
+        const next = pickNextCodecTo(codec)
+        if (!next) {
+          decoderUnsupported.value = true
+          awaitingCodecSwitch.value = false
+          return
+        }
+        console.log('[webcodecs] sharer cannot produce', codec, '— trying', next)
+        // Reset debounce so requestCodecSwitch fires immediately for the new target.
+        lastSwitchRequestAt.delete(next)
+        socket.emit('need-codec', { avoid: codec, wanted: next })
+      }
+    })
 
     socket.on('chat', ({ from, name, text, image, ts }) => {
       messages.push({
@@ -1484,10 +1796,10 @@ export function useRoom(roomId) {
     if (wt.value) { try { wt.value.close() } catch {}; wt.value = null }
     for (const id of Array.from(peers.keys())) cleanupPeer(id)
     if (audioCtx) { try { audioCtx.close() } catch {} audioCtx = null }
+    if (micCtx) { try { micCtx.close() } catch {} micCtx = null }
     if (screenAudioCtx) { try { screenAudioCtx.close() } catch {} screenAudioCtx = null }
-    // Reset per-context worklet load state so re-entering the room next time
-    // doesn't inherit a promise tied to a closed AudioContext.
-    workletReady = null
+    // Per-context worklet promises are held in a WeakMap keyed on the
+    // AudioContext, so closing the contexts is enough to let them GC.
     if (socket) { try { socket.disconnect() } catch {} }
   }
 
@@ -1531,6 +1843,11 @@ export function useRoom(roomId) {
     retimeScreen,
     focusScreen,
     leave,
+
+    // ---------- identity ----------
+    authState,
+    submitPassword,
+    setName,
 
     // ---------- mixer ----------
     masterVoiceVolume,

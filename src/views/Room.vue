@@ -10,7 +10,54 @@ const route = useRoute()
 const router = useRouter()
 const roomId = String(route.params.id || '').toUpperCase()
 
-const room = useRoom(roomId)
+// Landing.vue may pass a room-creator password via history.state.setPassword.
+// Read it exactly once, then wipe the state so a refresh doesn't re-register
+// (or leak the password into the entry the browser will restore on Back).
+const setPasswordFromState = (() => {
+  try {
+    const s = window.history.state
+    const p = s && typeof s.setPassword === 'string' ? s.setPassword : null
+    if (p) {
+      const clean = { ...s }
+      delete clean.setPassword
+      window.history.replaceState(clean, '')
+    }
+    return p
+  } catch { return null }
+})()
+
+const room = useRoom(roomId, setPasswordFromState ? { setPassword: setPasswordFromState } : {})
+
+// Password prompt (rendered when server returns auth-required).
+const pwdInput = ref('')
+const pwdBusy = computed(() => room.authState.state === 'checking')
+function submitPasswordPrompt() {
+  const v = pwdInput.value.trim()
+  if (!v) return
+  room.submitPassword(v)
+  pwdInput.value = ''
+}
+function cancelPasswordPrompt() {
+  router.push('/')
+}
+
+// In-room rename — clicking the name in the footer opens a small inline editor.
+const renaming = ref(false)
+const renameInput = ref('')
+const renameInputEl = ref(null)
+function startRename() {
+  renameInput.value = room.me.name
+  renaming.value = true
+  nextTick(() => renameInputEl.value?.select())
+}
+function commitRename() {
+  const v = renameInput.value.trim()
+  if (v && v !== room.me.name) room.setName(v)
+  renaming.value = false
+}
+function cancelRename() {
+  renaming.value = false
+}
 
 const chatInput = ref('')
 const chatScroller = ref(null)
@@ -776,13 +823,87 @@ onUnmounted(() => {
 
         <div class="ctl-spacer"></div>
 
-        <div class="ctl-you">
+        <div class="ctl-you" :class="{ editing: renaming }">
           <span class="mono">YOU</span>
-          <span class="ctl-you-name">{{ room.me.name }}</span>
+          <template v-if="!renaming">
+            <button
+              class="ctl-you-name btn-rename"
+              @click="startRename"
+              :title="'点击改名'"
+            >
+              {{ room.me.name }}
+              <span class="rename-pencil" aria-hidden="true">✎</span>
+            </button>
+          </template>
+          <template v-else>
+            <input
+              ref="renameInputEl"
+              v-model="renameInput"
+              class="rename-input"
+              maxlength="24"
+              spellcheck="false"
+              @keydown.enter.prevent="commitRename"
+              @keydown.esc.prevent="cancelRename"
+              @blur="commitRename"
+              aria-label="修改名字"
+            />
+          </template>
           <span class="live-mini" :class="{ on: room.me.micOn && room.me.level > 0.05 }"></span>
         </div>
       </div>
     </footer>
+
+    <!-- password prompt (server said auth-required) -->
+    <transition name="toast">
+      <div
+        v-if="room.authState.state === 'prompting' || room.authState.state === 'checking'"
+        class="pwd-veil"
+      >
+        <form class="pwd-dialog" @submit.prevent="submitPasswordPrompt">
+          <div class="pwd-hdr">
+            <span class="mono pwd-tag">ROOM · 密码保护</span>
+            <span class="mono pwd-code">{{ formattedCode }}</span>
+          </div>
+          <p class="pwd-lead">
+            <span v-if="room.authState.reason === 'wrong'" class="pwd-err">
+              密码不正确 · 请重试
+            </span>
+            <span v-else>
+              这个房间设有密码 · 请输入以进入
+            </span>
+          </p>
+          <input
+            v-model="pwdInput"
+            type="password"
+            class="pwd-input"
+            placeholder="房间密码"
+            autocomplete="off"
+            spellcheck="false"
+            :disabled="pwdBusy"
+            autofocus
+            aria-label="房间密码"
+          />
+          <div class="pwd-foot">
+            <button
+              type="button"
+              class="pwd-cancel"
+              @click="cancelPasswordPrompt"
+              :disabled="pwdBusy"
+            >
+              返回
+            </button>
+            <button
+              type="submit"
+              class="pwd-go"
+              :disabled="pwdBusy || !pwdInput.trim()"
+            >
+              <span v-if="!pwdBusy">进入 <span class="arrow">→</span></span>
+              <span v-else>验证中…</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </transition>
 
     <!-- image lightbox -->
     <transition name="toast">
@@ -1886,5 +2007,139 @@ onUnmounted(() => {
   .controls-inner { flex-wrap: wrap; }
   .ctl-you { display: none; }
   .ctl-label .ctl-hint { display: none; }
+}
+
+/* ============= password prompt ============= */
+.pwd-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(6, 6, 8, 0.72);
+  backdrop-filter: blur(6px);
+}
+.pwd-dialog {
+  width: min(92vw, 380px);
+  background: var(--panel-hi);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 22px 22px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.8);
+}
+.pwd-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.pwd-tag { color: var(--signal); font-size: 10px; letter-spacing: 0.16em; }
+.pwd-code {
+  color: var(--signal-hot);
+  font-size: 14px;
+  letter-spacing: 0.14em;
+}
+.pwd-lead {
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+.pwd-err { color: var(--danger); }
+.pwd-input {
+  height: 42px;
+  padding: 0 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.pwd-input:focus {
+  outline: none;
+  border-color: var(--signal);
+  box-shadow: 0 0 0 3px var(--signal-soft);
+}
+.pwd-input:disabled { opacity: 0.6; }
+.pwd-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 6px;
+}
+.pwd-cancel {
+  padding: 8px 14px;
+  color: var(--text-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 12px;
+}
+.pwd-cancel:hover:not(:disabled) { color: var(--text); border-color: var(--line-soft); background: var(--panel-2); }
+.pwd-go {
+  padding: 8px 18px;
+  background: var(--signal);
+  color: #1A1200;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pwd-go:hover:not(:disabled) { background: var(--signal-hot); }
+.pwd-go:disabled { opacity: 0.5; cursor: not-allowed; }
+.pwd-go .arrow { font-family: var(--font-mono); }
+
+/* ============= rename (footer YOU chip) ============= */
+.ctl-you.editing {
+  border-color: var(--signal);
+  background: var(--panel-2);
+}
+.btn-rename {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  padding: 4px 8px;
+  border: 1px dashed transparent;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: color 140ms var(--ease), border-color 140ms var(--ease), background 140ms var(--ease);
+}
+.btn-rename:hover {
+  color: var(--signal);
+  border-color: var(--signal-soft);
+  background: var(--panel-2);
+}
+.rename-pencil {
+  color: var(--muted);
+  font-size: 11px;
+  transition: color 140ms var(--ease);
+}
+.btn-rename:hover .rename-pencil { color: var(--signal); }
+.rename-input {
+  min-width: 120px;
+  height: 26px;
+  padding: 0 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--signal);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--signal-soft);
 }
 </style>

@@ -10,10 +10,27 @@ function setInputRef(i, el) { inputs[i] = el }
 const clock = ref('00:00')
 const CHARSET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
+// Handle + optional new-room password — persist so returning users don't
+// re-type. Password only applies to the room *we're* about to create; joining
+// an existing password-protected room prompts on demand inside Room.vue.
+const NAME_KEY = 'qt.name'
+const displayName = ref('')
+const createPassword = ref('')
+const showCreatePwd = ref(false)
+const NAME_MAX = 24
+
 const full = computed(() => digits.value.every((d) => d.length === 1))
 const codePreview = computed(() =>
   digits.value.map((d, i) => (d || (i === 0 ? '_' : '·'))).join('')
 )
+
+function persistName() {
+  const v = displayName.value.trim()
+  try {
+    if (v) localStorage.setItem(NAME_KEY, v)
+    else localStorage.removeItem(NAME_KEY)
+  } catch {}
+}
 
 function normalize(v) {
   return (v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 1)
@@ -48,6 +65,7 @@ function onPaste(e) {
 
 function join() {
   if (!full.value) return
+  persistName()
   const code = digits.value.join('')
   router.push({ name: 'room', params: { id: code } })
 }
@@ -61,8 +79,14 @@ function randomCode() {
 }
 
 function create() {
+  persistName()
   const code = randomCode()
-  router.push({ name: 'room', params: { id: code } })
+  // Pass password via router state — not query string, not URL. Room.vue reads
+  // it once on mount, sends it up as the room-creator's password, then wipes it.
+  const state = createPassword.value.trim()
+    ? { setPassword: createPassword.value }
+    : {}
+  router.push({ name: 'room', params: { id: code }, state })
 }
 
 let timer
@@ -77,6 +101,7 @@ function tick() {
 onMounted(() => {
   tick()
   timer = setInterval(tick, 1000)
+  try { displayName.value = localStorage.getItem(NAME_KEY) || '' } catch {}
   nextTick(() => inputs[0]?.focus())
 })
 onUnmounted(() => clearInterval(timer))
@@ -108,6 +133,26 @@ onUnmounted(() => clearInterval(timer))
       <span class="tick tick-br" aria-hidden="true"></span>
 
       <section class="hero">
+        <div class="eyebrow">
+          <span class="mono num">00</span>
+          <span class="eyebrow-line"></span>
+          <span class="mono">CALL SIGN · 呼号</span>
+        </div>
+
+        <div class="handle-row">
+          <input
+            v-model="displayName"
+            @change="persistName"
+            type="text"
+            :maxlength="NAME_MAX"
+            class="handle-input"
+            placeholder="留空则随机分配"
+            spellcheck="false"
+            aria-label="你的名字"
+          />
+          <span class="handle-hint mono">进入房间后仍可改</span>
+        </div>
+
         <div class="eyebrow">
           <span class="mono num">01</span>
           <span class="eyebrow-line"></span>
@@ -161,11 +206,42 @@ onUnmounted(() => clearInterval(timer))
           <span class="mono">OPEN NEW CHANNEL · 建立频道</span>
         </div>
 
-        <button class="btn-secondary" @click="create">
-          <span class="plus">+</span>
-          <span>开一个房间</span>
-          <span class="mono hint">系统随机生成 6 位呼号</span>
-        </button>
+        <div class="create-block">
+          <button class="btn-secondary" @click="create">
+            <span class="plus">+</span>
+            <span>开一个房间</span>
+            <span class="mono hint">系统随机生成 6 位呼号</span>
+          </button>
+          <button
+            type="button"
+            class="pwd-toggle mono"
+            :class="{ on: showCreatePwd || createPassword }"
+            @click="showCreatePwd = !showCreatePwd"
+            :aria-expanded="showCreatePwd"
+          >
+            <span class="pwd-toggle-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="4" y="10" width="16" height="10" rx="2" />
+                <path d="M8 10V7a4 4 0 0 1 8 0v3" />
+              </svg>
+            </span>
+            <span>{{ createPassword ? `已设 · ${createPassword.length} 位` : '设置密码 · 可选' }}</span>
+            <span class="pwd-toggle-chev" :class="{ open: showCreatePwd }">▾</span>
+          </button>
+          <div v-if="showCreatePwd" class="pwd-panel">
+            <input
+              v-model="createPassword"
+              type="text"
+              maxlength="32"
+              class="pwd-input"
+              placeholder="留空 = 公开房间"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="房间密码"
+            />
+            <p class="pwd-hint mono">仅创房生效 · 后续加入者需输入此密码</p>
+          </div>
+        </div>
       </section>
 
       <aside class="marginalia">
@@ -402,6 +478,91 @@ onUnmounted(() => clearInterval(timer))
   background: var(--signal);
   box-shadow: 0 0 8px var(--signal);
 }
+
+/* ---------- handle (call sign) row ---------- */
+.handle-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 34px;
+}
+.handle-input {
+  height: 44px;
+  padding: 0 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  caret-color: var(--signal);
+  transition: border-color 160ms var(--ease), background 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.handle-input::placeholder { color: var(--muted); font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.06em; }
+.handle-input:focus {
+  outline: none;
+  border-color: var(--signal);
+  background: var(--panel-2);
+  box-shadow: 0 0 0 3px var(--signal-soft);
+}
+.handle-hint { color: var(--muted); font-size: 10px; letter-spacing: 0.14em; }
+@media (max-width: 520px) {
+  .handle-row { grid-template-columns: 1fr; gap: 6px; }
+  .handle-hint { text-align: right; }
+}
+
+/* ---------- create block (password toggle) ---------- */
+.create-block { display: flex; flex-direction: column; gap: 12px; }
+.pwd-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease);
+}
+.pwd-toggle:hover,
+.pwd-toggle.on {
+  color: var(--cool, var(--signal));
+  border-color: var(--cool-soft, var(--signal-soft));
+  border-style: solid;
+  background: var(--panel);
+}
+.pwd-toggle-ico { display: inline-flex; width: 14px; height: 14px; }
+.pwd-toggle-ico svg { width: 100%; height: 100%; }
+.pwd-toggle-chev { font-size: 10px; transition: transform 200ms var(--ease); }
+.pwd-toggle-chev.open { transform: rotate(180deg); }
+.pwd-panel {
+  padding: 12px 14px 4px;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  background: var(--panel);
+}
+.pwd-input {
+  width: 100%;
+  height: 38px;
+  padding: 0 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  transition: border-color 160ms var(--ease);
+}
+.pwd-input::placeholder { color: var(--muted); }
+.pwd-input:focus { outline: none; border-color: var(--signal); }
+.pwd-hint { color: var(--muted); font-size: 10px; margin: 8px 2px 0; letter-spacing: 0.06em; }
 
 /* buttons */
 .btn-primary {
