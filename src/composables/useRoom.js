@@ -1490,6 +1490,14 @@ export function useRoom(roomId, opts = {}) {
       return
     }
     if (msg?.data?.byteLength) tallyRx(from, msg.data.byteLength, true)
+    // Any incoming chunk — WT or socket.io — proves frames are flowing.
+    // The stall watchdog uses lastFrameTs to decide whether to nag `need-tcp`;
+    // if we only touched it on the socket.io path (like we did originally),
+    // a perfectly healthy WT link would look "stalled" and get killed after
+    // 7 s. That's the bug behind "sharer sees 0% loss, viewer still asks for
+    // TCP fallback".
+    const p = peers.get(from)
+    if (p) p.lastFrameTs = performance.now()
     let dec = videoDecoders.get(from)
     // Config → (re)build decoder
     if (msg.config) {
