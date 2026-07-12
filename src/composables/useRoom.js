@@ -656,7 +656,31 @@ export function useRoom(roomId, opts = {}) {
   // support different ones. We try them all in order.
   const CODEC_CANDIDATES = [
     { id: 'vp9',  label: 'VP9',   strings: ['vp09.00.10.08', 'vp09.00.31.08', 'vp09.02.10.10', 'vp9'] },
-    { id: 'h264', label: 'H.264', strings: ['avc1.42E01F', 'avc1.42001E', 'avc1.42E01E', 'avc1.4D401F', 'avc1.4D001F', 'avc1.640028'] },
+    // H.264 profile/level strings, ordered by DECODER compatibility.
+    //   42xxxx = Baseline (widest support — mobile Safari, older Android, etc.)
+    //   4Dxxxx = Main    (still very broad)
+    //   64xxxx = High    (many mobile decoders REJECT this — last resort)
+    // The two hex digits at the end are the level:
+    //   1F = 3.1 (≤ 720p30),  28 = 4.0 (≤ 1080p30),  29 = 4.1 (≤ 1080p60),
+    //   32 = 5.0 (≤ 4K30),    33 = 5.1 (≤ 4K60)
+    // We need higher-level Baseline/Main entries — otherwise the ONLY probe
+    // that passes at 1080p is High @ 4.0, and any viewer that can't decode
+    // High profile forces a fallback to VP8.
+    { id: 'h264', label: 'H.264', strings: [
+      'avc1.42E01F',   // Baseline 3.1 (720p)
+      'avc1.42E028',   // Baseline 4.0 (1080p)
+      'avc1.42E029',   // Baseline 4.1 (1080p60)
+      'avc1.42E032',   // Baseline 5.0 (4K30)
+      'avc1.42E033',   // Baseline 5.1 (4K60)
+      'avc1.4D401F',   // Main 3.1
+      'avc1.4D4028',   // Main 4.0
+      'avc1.4D4029',   // Main 4.1
+      'avc1.4D4032',   // Main 5.0
+      'avc1.4D4033',   // Main 5.1
+      'avc1.640028',   // High 4.0 (last — many decoders reject)
+      'avc1.640032',   // High 5.0
+      'avc1.640033'    // High 5.1
+    ] },
     { id: 'vp8',  label: 'VP8',   strings: ['vp8'] },
     { id: 'av1',  label: 'AV1',   strings: ['av01.0.04M.08'] }
   ]
