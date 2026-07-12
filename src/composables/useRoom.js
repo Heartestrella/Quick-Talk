@@ -1357,6 +1357,15 @@ export function useRoom(roomId, opts = {}) {
     } catch (e) { console.warn('screen-audio decode', e) }
   }
 
+  // Per-peer dedup — sharer sends keyframes over WT AND socket.io, so viewer
+  // receives each keyframe twice. Whichever gets in first wins; the second
+  // is dropped by ts match.
+  const seenChunkTs = new Map()          // peerId -> Set<ts>  (recent-only)
+  const SEEN_WINDOW = 200                // ~7 s at 30 fps
+  // Per-peer key/delta arrival counters for a per-second console log — lets
+  // the user see whether keyframes are actually reaching them.
+  const rxCounters = new Map()           // peerId -> { key, delta, dedup, lastLogAt }
+
   // Per-peer tracking of the last chunk timestamp we FED to the decoder.
   // QUIC uni-streams don't preserve order between streams — chunk N+1 can
   // land before chunk N. If we blindly feed the decoder in arrival order,
@@ -1548,6 +1557,41 @@ export function useRoom(roomId, opts = {}) {
     const p = peers.get(from)
     if (p) p.lastFrameTs = performance.now()
 
+    // ---- Dual-send dedup ----
+    // Sharer mirrors keyframes over WT + socket.io; if we already handled
+    // this ts, drop the second copy silently.
+    let seen = seenChunkTs.get(from)
+    if (!seen) { seen = new Set(); seenChunkTs.set(from, seen) }
+    let counter = rxCounters.get(from)
+    if (!counter) { counter = { key: 0, delta: 0, dedup: 0, lastLogAt: performance.now() }
+      rxCounters.set(from, counter)
+    }
+    if (seen.has(msg.ts)) {
+      counter.dedup++
+      // Fall through to the periodic log below, then bail.
+      const now = performance.now()
+      if (now - counter.lastLogAt > 1000) {
+        console.log(`[rx] ${from.slice(0, 6)}  key=${counter.key} delta=${counter.delta} dedup=${counter.dedup}`)
+        counter.key = 0; counter.delta = 0; counter.dedup = 0
+        counter.lastLogAt = now
+      }
+      return
+    }
+    seen.add(msg.ts)
+    if (seen.size > SEEN_WINDOW) {
+      // Sets iterate in insertion order — evict the oldest.
+      const first = seen.values().next().value
+      seen.delete(first)
+    }
+    if (msg.type === 'key') counter.key++
+    else counter.delta++
+    const nowLog = performance.now()
+    if (nowLog - counter.lastLogAt > 1000) {
+      console.log(`[rx] ${from.slice(0, 6)}  key=${counter.key} delta=${counter.delta} dedup=${counter.dedup}`)
+      counter.key = 0; counter.delta = 0; counter.dedup = 0
+      counter.lastLogAt = nowLog
+    }
+
     // ---- QUIC uni-stream reordering ----
     // WT delivers each chunk on its own uni-stream, and between-stream
     // ordering isn't guaranteed. A chunk that arrives with ts LESS than the
@@ -1661,22 +1705,30 @@ export function useRoom(roomId, opts = {}) {
           description: msg.config.description ? bytesToB64(msg.config.description) : ''
         }
       }
-      // sendChunk resolves to a boolean (true = sent, false = failed).
-      // If it fails we IMMEDIATELY re-send the same chunk over socket.io so
-      // the viewer doesn't miss a frame just because one QUIC stream flopped.
-      // This is especially important for keyframes — losing a keyframe leaves
-      // the viewer stuck on a stale image until the next 20-s natural key.
+      // Dual-send keyframes over BOTH WT (low-latency, may drop) and
+      // socket.io (higher latency, TCP-reliable). Whichever arrives first at
+      // the viewer wins — the other gets deduped by ts. Deltas stay
+      // WT-only because they're 10× more numerous; doubling them would cost
+      // ~30% bandwidth for negligible robustness win.
+      //
+      // Why: a lost keyframe over UDP leaves the viewer stuck on a stale
+      // canvas for up to `KEY_EVERY_WT` seconds while every delta arriving
+      // in between fails to decode. Losing ~5% of keyframes to UDP jitter
+      // shows up as "画面残留数秒". Mirroring keyframes on TCP eliminates
+      // that failure mode without significantly bloating the wire.
+      if (msg.type === 'key' && socket?.connected) socket.emit('video', msg)
       wt.value.sendChunk(WT_KIND.VIDEO, msg.ts, meta, new Uint8Array(msg.data)).then((ok) => {
         const now = performance.now()
         if (ok) wtSendStats.ok++
         else {
           wtSendStats.fail++
-          if (socket?.connected) socket.emit('video', msg)
+          // Delta failed on WT and wasn't mirrored above — send via socket.io.
+          if (msg.type !== 'key' && socket?.connected) socket.emit('video', msg)
         }
         logWtStats(now)
       }).catch(() => {
         wtSendStats.fail++
-        if (socket?.connected) socket.emit('video', msg)
+        if (msg.type !== 'key' && socket?.connected) socket.emit('video', msg)
         logWtStats(performance.now())
       })
       return
@@ -2028,6 +2080,8 @@ export function useRoom(roomId, opts = {}) {
     lastChunkTs.delete(id)
     lastKeyAt.delete(id)
     reorderBuf.delete(id)
+    seenChunkTs.delete(id)
+    rxCounters.delete(id)
     screenCanvases.delete(id)
     const adec = screenAudioDecoders.get(id)
     if (adec) { try { adec.close() } catch {}; screenAudioDecoders.delete(id) }
