@@ -120,52 +120,44 @@ export function useRoom(roomId, opts = {}) {
   // User preference — 'auto' (default: use WT when healthy) or 'tcp' (never
   // use WT). Persisted so a user who has decided QUIC is worse on their
   // network doesn't have to flip it every session.
-  //   'auto' — use WT when healthy, fall back to socket on stall (default)
-  //   'tcp'  — never use WT, no matter what
-  //   'wt'   — always try WT, DO NOT auto-fall-back (for debugging UDP)
+  //   'tcp' (default) — screen chunks always over socket.io. Reliable, ordered.
+  //   'wt'            — screen chunks over WebTransport / QUIC. Lower latency,
+  //                     but any UDP loss shows up as picture tearing / stale
+  //                     tiles until the next keyframe.
+  //
+  // Kept dead simple after multiple rounds of debugging: no auto fallback, no
+  // watchdogs. The user chooses; a persistent warning banner reminds them
+  // (and every viewer in the room) of the tradeoff while UDP is active.
   const TRANSPORT_KEY = 'qt.transport'
   const preferTransport = ref((() => {
     try {
       const v = localStorage.getItem(TRANSPORT_KEY)
-      if (v === 'tcp' || v === 'wt') return v
-      return 'auto'
-    } catch { return 'auto' }
+      return v === 'wt' ? 'wt' : 'tcp'
+    } catch { return 'tcp' }
   })())
   watch(preferTransport, (v) => {
-    try {
-      const clean = v === 'tcp' || v === 'wt' ? v : 'auto'
-      localStorage.setItem(TRANSPORT_KEY, clean)
-    } catch {}
-    // Any preference change → force a keyframe so viewers see it immediately
-    // rather than waiting up to 20 s for the natural cadence.
+    try { localStorage.setItem(TRANSPORT_KEY, v === 'wt' ? 'wt' : 'tcp') } catch {}
+    // Force a keyframe so viewers see the transport swap immediately.
     if (me.screenOn) vForceKey = true
-    // Bumping OUT of auto-forced (e.g. user manually re-picks 'wt' or 'auto')
-    // clears the session-scoped fallback so WT gets another chance.
-    if (v === 'wt') autoForcedTcp.value = false
+    // Broadcast the switch so every viewer knows we're on UDP and gets the
+    // "画面可能撕裂" warning banner. Also fires on toggle back to TCP so the
+    // banner clears.
+    broadcastTransportMode()
   })
-  // Session-scoped: viewer told us via `need-tcp` that WT looks broken from
-  // their side. Auto-fall-back until this share ends. Not persisted — a
-  // sharer restarting the share gets a fresh chance on WT.
-  const autoForcedTcp = ref(false)
-  // Human-readable reason the transport got forced. Shown in the UI tooltip
-  // so users can see WHY it happened, not just that it happened.
-  const autoForcedReason = ref('')
   const senderTransport = computed(() => {
-    if (preferTransport.value === 'tcp') return 'tcp-forced'
-    if (preferTransport.value === 'wt') {
-      // User wants WT no matter what — if it's not healthy, we still
-      // technically emit through socket (data > protocol purity), but the
-      // chip stays 'wt' so they know their preference isn't being subverted.
-      return (wt.value && wt.value.healthy.value) ? 'wt' : 'wt-degraded'
-    }
-    if (autoForcedTcp.value) return 'tcp-auto'
-    return (wt.value && wt.value.healthy.value) ? 'wt' : 'socket'
+    if (preferTransport.value === 'tcp') return 'tcp'
+    return (wt.value && wt.value.healthy.value) ? 'wt' : 'wt-degraded'
   })
   function useWtNow() {
-    if (preferTransport.value === 'tcp') return false
-    // 'wt' preference skips autoForcedTcp — user wants raw WT for debugging.
-    if (preferTransport.value !== 'wt' && autoForcedTcp.value) return false
+    if (preferTransport.value !== 'wt') return false
     return !!(wt.value && wt.value.healthy.value)
+  }
+  // What the currently-focused sharer is using, as seen by viewers. Keyed by
+  // peerId. Populated via socket `sharer-transport` events from each sharer.
+  const peerTransportMode = reactive(new Map())   // peerId -> 'wt' | 'tcp'
+  function broadcastTransportMode() {
+    if (!socket?.connected || !me.screenOn) return
+    socket.emit('sharer-transport', { mode: preferTransport.value })
   }
   let wtInfo = null                          // { url, token } cached for reconnect
 
@@ -957,13 +949,13 @@ export function useRoom(roomId, opts = {}) {
       vEncoder._h = height
       vEncoder._opts = chosen.opts
 
-      // Fresh share — reset any prior auto-fallback so we give WT a chance
-      // on this attempt. (Manual TCP preference stays sticky, obviously.)
-      autoForcedTcp.value = false
-      autoForcedReason.value = ''
       me.screenOn = true
       activeScreenPeerId.value = 'me'
       broadcastState()
+      // Tell viewers immediately which transport they're about to see. If
+      // sharer is on WT we want the "画面可能撕裂" banner to appear as soon
+      // as the share starts, not lag behind by any amount.
+      broadcastTransportMode()
 
       // Clone the display track for the encoder — the original still powers
       // the local <video> preview. Without this, encoder backpressure and the
@@ -2015,23 +2007,13 @@ export function useRoom(roomId, opts = {}) {
         swapCodec(family).catch((e) => console.warn('swapCodec (rejected string) failed', e))
       }
     })
-    // Viewer is saying: I see you sharing, but I'm not receiving frames —
-    // switch to plain socket.io. We drop out of WT for the rest of this share.
-    // A fresh screen-share start clears autoForcedTcp so the next attempt
-    // gets to try WT again.
-    // Honoured only when preferTransport === 'auto'. If the user explicitly
-    // demanded WT (for debugging) or already TCP, this is a no-op.
-    socket.on('need-tcp', () => {
-      if (!me.screenOn) return
-      if (preferTransport.value !== 'auto') {
-        console.warn('[transport] viewer asked for TCP but user preference is', preferTransport.value, '— ignoring')
-        return
-      }
-      if (autoForcedTcp.value) return
-      console.warn('[transport] viewer requested TCP fallback — disabling WT for this share')
-      autoForcedTcp.value = true
-      autoForcedReason.value = '观看端 3.5s 未收到帧 · 自动切 TCP'
-      vForceKey = true
+    // Sharer told viewers which transport they're using — populate map so
+    // viewers can show the "画面可能撕裂" banner while UDP is active.
+    socket.on('sharer-transport', (payload) => {
+      if (!payload) return
+      const fromId = payload.from   // server tags this
+      const mode = payload.mode === 'wt' ? 'wt' : 'tcp'
+      if (fromId) peerTransportMode.set(fromId, mode)
     })
 
     // Sharer told us they can't produce this codec. Mark it so pickNextCodecTo
@@ -2082,6 +2064,7 @@ export function useRoom(roomId, opts = {}) {
     reorderBuf.delete(id)
     seenChunkTs.delete(id)
     rxCounters.delete(id)
+    peerTransportMode.delete(id)
     screenCanvases.delete(id)
     const adec = screenAudioDecoders.get(id)
     if (adec) { try { adec.close() } catch {}; screenAudioDecoders.delete(id) }
@@ -2162,58 +2145,7 @@ export function useRoom(roomId, opts = {}) {
     }
   }, 1000)
 
-  // Viewer-side stall watchdog: if a peer is marked screenOn but we've had
-  // no frames from them for a while, ask them to fall back to TCP. Fires at
-  // most once per stall — reset when frames start flowing again, or when the
-  // sharer stops sharing.
-  //   FIRST_FRAME_GRACE_MS: extra warmup for the initial frame. codec probing
-  //     (~15 nope's), encoder configure, first-keyframe emit and WT stream
-  //     setup all happen in this window. Nagging inside that would fire even
-  //     on a perfectly healthy WT link, which is what was happening in the
-  //     "chosen avc1.42E028 → viewer requested TCP fallback" log.
-  //   STALL_MS: gap allowed once frames HAVE been flowing.
-  const FIRST_FRAME_GRACE_MS = 7000
-  const STALL_MS = 3500
-  const NAG_COOLDOWN_MS = 8000             // don't spam need-tcp
-  const stallState = new Map()             // peerId -> { firstStallAt, lastNagAt }
-  const stallTimer = setInterval(() => {
-    if (!socket?.connected) return
-    const now = performance.now()
-    for (const p of peers.values()) {
-      if (!p.screenOn) { stallState.delete(p.id); continue }
-      const last = p.lastFrameTs || 0
-      // Never received a frame → measure gap from when screenOn flipped on.
-      // First-frame grace is bigger than steady-state STALL_MS to cover
-      // encoder warmup + codec probe.
-      if (!last) {
-        const startedAt = p.screenOnAt || now
-        const s = stallState.get(p.id) || { firstStallAt: startedAt, lastNagAt: 0 }
-        stallState.set(p.id, s)
-        if (now - s.firstStallAt > FIRST_FRAME_GRACE_MS && now - s.lastNagAt > NAG_COOLDOWN_MS) {
-          console.warn('[transport] no frames from', p.id.slice(0, 6), '— asking sharer to switch to TCP')
-          socket.emit('need-tcp')
-          s.lastNagAt = now
-        }
-        continue
-      }
-      const gap = now - last
-      if (gap > STALL_MS) {
-        const s = stallState.get(p.id) || { firstStallAt: last, lastNagAt: 0 }
-        stallState.set(p.id, s)
-        if (now - s.lastNagAt > NAG_COOLDOWN_MS) {
-          console.warn('[transport] frames from', p.id.slice(0, 6), 'stalled', Math.round(gap), 'ms — asking sharer to switch to TCP')
-          socket.emit('need-tcp')
-          s.lastNagAt = now
-        }
-      } else {
-        // Frames flowing again — forget the stall record.
-        stallState.delete(p.id)
-      }
-    }
-  }, 1000)
-
   onUnmounted(() => {
-    clearInterval(stallTimer)
     clearInterval(keyStarveTimer)
     leave()
   })
@@ -2222,6 +2154,18 @@ export function useRoom(roomId, opts = {}) {
   const anyScreen = computed(() => {
     if (me.screenOn) return true
     for (const p of peers.values()) if (p.screenOn) return true
+    return false
+  })
+
+  // Any active sharer currently on WT/UDP → all room members show the
+  // "画面可能撕裂" banner. Self's mode is preferTransport; peers' is
+  // whatever they last broadcast via `sharer-transport`.
+  const anySharerOnUdp = computed(() => {
+    if (me.screenOn && preferTransport.value === 'wt') return true
+    for (const p of peers.values()) {
+      if (!p.screenOn) continue
+      if (peerTransportMode.get(p.id) === 'wt') return true
+    }
     return false
   })
 
@@ -2243,11 +2187,10 @@ export function useRoom(roomId, opts = {}) {
     hasEncoder: HAS_ENCODER,
     hasDecoder: HAS_DECODER,
     isSecure: IS_SECURE,
-    senderTransport,          // 'wt' | 'socket' | 'tcp-forced' | 'tcp-auto' — reactive
+    senderTransport,          // 'wt' | 'wt-degraded' | 'tcp' — reactive
     hasWebTransport: HAS_WEBTRANSPORT,
-    preferTransport,          // ref: 'auto' | 'tcp' | 'wt' — user's preference (persisted)
-    autoForcedTcp,            // ref: session-only auto fallback flag
-    autoForcedReason,         // ref: human-readable reason for the fallback
+    preferTransport,          // ref: 'tcp' (default) | 'wt' — persisted
+    anySharerOnUdp,           // computed<bool>: any active sharer on UDP right now
     toggleMic,
     toggleScreen,
     toggleDenoise,

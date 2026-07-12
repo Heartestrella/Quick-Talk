@@ -300,12 +300,13 @@ io.on('connection', (socket) => {
     socket.to(currentRoom).emit('codec-string-unsupported', { codec })
   })
 
-  // Viewer's screen-transport is stalling — probably WebTransport blocked by
-  // NAT / middlebox. Relay to the room; the sharer that owns the current
-  // share will drop back to plain socket.io for the remainder of the share.
-  socket.on('need-tcp', () => {
+  // Sharer telling viewers which transport (wt / tcp) they're using. Relayed
+  // so viewers can render a "分享者使用 UDP · 画面可能撕裂" banner.
+  socket.on('sharer-transport', (payload) => {
     if (!currentRoom) return
-    socket.to(currentRoom).emit('need-tcp')
+    if (!payload || typeof payload !== 'object') return
+    const mode = payload.mode === 'wt' ? 'wt' : 'tcp'
+    socket.to(currentRoom).emit('sharer-transport', { mode, from: socket.id })
   })
 
   // Sharer reports they can't encode a codec the viewer just asked for.

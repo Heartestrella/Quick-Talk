@@ -59,17 +59,12 @@ function cancelRename() {
   renaming.value = false
 }
 
-// Transport chip — click cycles user preference AUTO → TCP → WT → AUTO.
-//   AUTO: WT when healthy, auto-fallback to TCP on stall (default)
-//   TCP:  never use WT
-//   WT:   always use WT, ignore observers' TCP requests (debug mode)
+// Transport chip — two states: TCP (default, reliable) ↔ UDP (QUIC / WT,
+// low-latency but picture may tear).
 const transportLabel = computed(() => {
   switch (room.senderTransport.value) {
-    case 'wt':          return 'QUIC'
-    case 'wt-degraded': return 'QUIC · 无连接'
-    case 'socket':      return 'TCP'
-    case 'tcp-auto':    return 'TCP · 自动'
-    case 'tcp-forced':  return 'TCP · 强制'
+    case 'wt':          return 'UDP · QUIC'
+    case 'wt-degraded': return 'UDP · 无连接'
     default:            return 'TCP'
   }
 })
@@ -77,33 +72,15 @@ const transportClass = computed(() => {
   const t = room.senderTransport.value
   if (t === 'wt') return 'tp-wt'
   if (t === 'wt-degraded') return 'tp-auto'
-  if (t === 'tcp-auto') return 'tp-auto'
   return 'tp-tcp'
 })
-const transportForcedByUser = computed(() => room.preferTransport.value !== 'auto')
 const transportTitle = computed(() => {
   const pref = room.preferTransport.value
-  const t = room.senderTransport.value
-  const reason = room.autoForcedReason.value
-  const prefLine =
-    pref === 'wt'  ? '偏好：强制 QUIC（关自动 fallback，调试用）'
-    : pref === 'tcp' ? '偏好：强制 TCP'
-    : '偏好：AUTO（QUIC 健康时用 QUIC，观看端反馈丢帧就切 TCP）'
-  const nowLine = `当前实际：${
-    t === 'wt' ? 'QUIC / WebTransport'
-    : t === 'wt-degraded' ? 'QUIC session 未健康 → 实走 TCP'
-    : t === 'tcp-forced' ? 'TCP（你强制）'
-    : t === 'tcp-auto' ? `TCP（自动降级${reason ? ' · ' + reason : ''}）`
-    : 'TCP'
-  }`
-  return `${prefLine}\n${nowLine}\n点击切换：AUTO → TCP → WT`
+  if (pref === 'wt') return 'UDP / QUIC 模式 · 画面可能撕裂 · 点击切回 TCP'
+  return 'TCP 模式（默认，稳）· 点击切 UDP（更低延迟，可能撕裂）'
 })
 function toggleTransport() {
-  const cur = room.preferTransport.value
-  room.preferTransport.value =
-    cur === 'auto' ? 'tcp'
-    : cur === 'tcp' ? 'wt'
-    : 'auto'
+  room.preferTransport.value = room.preferTransport.value === 'wt' ? 'tcp' : 'wt'
 }
 
 const chatInput = ref('')
@@ -541,6 +518,17 @@ onUnmounted(() => {
           >×</button>
         </div>
       </transition>
+
+      <!-- UDP tearing warning — shown to EVERYONE (sharer + all viewers)
+           whenever any active sharer picked UDP. Persists until they switch
+           back or stop sharing. -->
+      <div v-if="room.anySharerOnUdp.value" class="disconnect-banner udp-banner">
+        <span class="dc-dot udp" aria-hidden="true"></span>
+        <span class="dc-text">
+          <span class="mono udp-tag">UDP</span>
+          分享者使用 UDP / QUIC 传输 · 画面可能撕裂或残留
+        </span>
+      </div>
 
       <!-- HTTPS / secure-context notice — persistent until fixed -->
       <div v-if="!room.isSecure" class="disconnect-banner danger secure-banner">
@@ -2065,6 +2053,28 @@ onUnmounted(() => {
   .controls-inner { flex-wrap: wrap; }
   .ctl-you { display: none; }
   .ctl-label .ctl-hint { display: none; }
+}
+
+/* ============= UDP warning banner ============= */
+.udp-banner {
+  border-color: #d1a24a;
+  background: linear-gradient(180deg, rgba(209, 162, 74, 0.16), rgba(209, 162, 74, 0.06)), var(--panel-hi);
+  color: var(--text);
+}
+.dc-dot.udp {
+  background: #d1a24a;
+  box-shadow: 0 0 8px #d1a24a;
+  animation: pulse 1.6s infinite var(--ease);
+}
+.udp-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  margin-right: 8px;
+  border: 1px solid #d1a24a;
+  border-radius: 3px;
+  color: #d1a24a;
+  font-size: 10px;
+  letter-spacing: 0.14em;
 }
 
 /* ============= transport chip ============= */
