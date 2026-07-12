@@ -59,6 +59,35 @@ function cancelRename() {
   renaming.value = false
 }
 
+// Transport chip — click cycles user preference between AUTO ↔ TCP.
+// Reflects senderTransport (which combines preference + healthy? + auto-forced).
+const transportLabel = computed(() => {
+  switch (room.senderTransport.value) {
+    case 'wt':         return 'QUIC'
+    case 'socket':     return 'TCP'
+    case 'tcp-auto':   return 'TCP · 自动'
+    case 'tcp-forced': return 'TCP · 强制'
+    default:           return 'TCP'
+  }
+})
+const transportClass = computed(() => {
+  const t = room.senderTransport.value
+  if (t === 'wt') return 'tp-wt'
+  if (t === 'tcp-auto') return 'tp-auto'
+  return 'tp-tcp'
+})
+const transportForcedByUser = computed(() => room.preferTransport.value === 'tcp')
+const transportTitle = computed(() => {
+  const t = room.senderTransport.value
+  if (t === 'wt') return '当前 QUIC / WebTransport · 点击强制切 TCP'
+  if (t === 'tcp-forced') return '你手动强制了 TCP · 点击恢复 AUTO'
+  if (t === 'tcp-auto') return '自动降级至 TCP（观看端反馈 QUIC 丢包）· 点击切换偏好'
+  return '当前 TCP · 点击切换偏好'
+})
+function toggleTransport() {
+  room.preferTransport.value = room.preferTransport.value === 'tcp' ? 'auto' : 'tcp'
+}
+
 const chatInput = ref('')
 const chatScroller = ref(null)
 const copyState = ref('idle')
@@ -91,6 +120,7 @@ const CODECS = [
   { key: 'auto', label: 'AUTO' },
   { key: 'vp9',  label: 'VP9' },
   { key: 'h264', label: 'H.264' },
+  { key: 'hevc', label: 'HEVC' },
   { key: 'vp8',  label: 'VP8' }
 ]
 const BITRATE_LABEL = (b) => {
@@ -405,6 +435,16 @@ onUnmounted(() => {
           <span class="pip" :class="{ on: room.connection.value === 'connected' }"></span>
           <span class="mono status-text">{{ statusLabel }}</span>
         </span>
+        <button
+          class="transport-chip"
+          :class="[transportClass, { forced: transportForcedByUser }]"
+          @click="toggleTransport"
+          :title="transportTitle"
+          type="button"
+        >
+          <span class="tp-dot" aria-hidden="true"></span>
+          <span class="mono tp-label">{{ transportLabel }}</span>
+        </button>
         <div class="mixer-anchor">
           <button
             class="mixer-btn"
@@ -2007,6 +2047,45 @@ onUnmounted(() => {
   .controls-inner { flex-wrap: wrap; }
   .ctl-you { display: none; }
   .ctl-label .ctl-hint { display: none; }
+}
+
+/* ============= transport chip ============= */
+.transport-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text-2);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease);
+}
+.transport-chip:hover {
+  color: var(--text);
+  border-color: var(--line-soft);
+  background: var(--panel-2);
+}
+.tp-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  box-shadow: none;
+  transition: background 160ms var(--ease), box-shadow 160ms var(--ease);
+}
+.transport-chip.tp-wt { color: var(--cool); border-color: var(--cool-soft); }
+.transport-chip.tp-wt .tp-dot { background: var(--cool); box-shadow: 0 0 8px var(--cool); }
+.transport-chip.tp-tcp { color: var(--signal); border-color: var(--signal-soft); }
+.transport-chip.tp-tcp .tp-dot { background: var(--signal); box-shadow: 0 0 6px var(--signal-glow); }
+.transport-chip.tp-auto { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+.transport-chip.tp-auto .tp-dot { background: var(--danger); box-shadow: 0 0 8px var(--danger); animation: pulse 1.4s infinite var(--ease); }
+.transport-chip.forced { border-style: dashed; }
+.tp-label { white-space: nowrap; }
+@media (max-width: 520px) {
+  .transport-chip { padding: 7px 8px; }
+  .tp-label { font-size: 10px; letter-spacing: 0.06em; }
 }
 
 /* ============= password prompt ============= */

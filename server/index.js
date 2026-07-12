@@ -277,12 +277,35 @@ io.on('connection', (socket) => {
   })
 
   // Viewer discovered it can't decode the current codec — ask any active
-  // sharer in the room to switch. Payload: { avoid, wanted }.
+  // sharer in the room to switch. Payload: { avoid, wanted, avoidString? }.
+  //   wanted:      target family ('h264' | 'hevc' | 'vp9' | ...)
+  //   avoidString: specific codec string the viewer rejected (e.g. avc1.640028)
+  //                so the sharer can pick a lower profile in the same family.
   socket.on('need-codec', (payload) => {
     if (!currentRoom) return
     if (!payload || typeof payload !== 'object') return
     const wanted = typeof payload.wanted === 'string' ? payload.wanted : 'h264'
-    socket.to(currentRoom).emit('need-codec', { wanted })
+    const avoidString = typeof payload.avoidString === 'string' ? payload.avoidString : undefined
+    socket.to(currentRoom).emit('need-codec', avoidString ? { wanted, avoidString } : { wanted })
+  })
+
+  // Viewer telling the sharer a specific codec string can't decode. Used to
+  // skip that exact profile/level on the next encoder pick without giving up
+  // the whole codec family.
+  socket.on('codec-string-unsupported', (payload) => {
+    if (!currentRoom) return
+    if (!payload || typeof payload !== 'object') return
+    const codec = typeof payload.codec === 'string' ? payload.codec : null
+    if (!codec) return
+    socket.to(currentRoom).emit('codec-string-unsupported', { codec })
+  })
+
+  // Viewer's screen-transport is stalling — probably WebTransport blocked by
+  // NAT / middlebox. Relay to the room; the sharer that owns the current
+  // share will drop back to plain socket.io for the remainder of the share.
+  socket.on('need-tcp', () => {
+    if (!currentRoom) return
+    socket.to(currentRoom).emit('need-tcp')
   })
 
   // Sharer reports they can't encode a codec the viewer just asked for.

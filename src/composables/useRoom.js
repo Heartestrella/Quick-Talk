@@ -117,9 +117,36 @@ export function useRoom(roomId, opts = {}) {
   // (session close, missed heartbeats). See useTransport.js for the details.
   const wt = shallowRef(null)                // holds the openWebTransport() return obj (or null)
   const HAS_WEBTRANSPORT = typeof window !== 'undefined' && typeof window.WebTransport !== 'undefined'
-  const senderTransport = computed(() =>
-    (wt.value && wt.value.healthy.value) ? 'wt' : 'socket'
-  )
+  // User preference — 'auto' (default: use WT when healthy) or 'tcp' (never
+  // use WT). Persisted so a user who has decided QUIC is worse on their
+  // network doesn't have to flip it every session.
+  const TRANSPORT_KEY = 'qt.transport'
+  const preferTransport = ref((() => {
+    try {
+      const v = localStorage.getItem(TRANSPORT_KEY)
+      return v === 'tcp' ? 'tcp' : 'auto'
+    } catch { return 'auto' }
+  })())
+  watch(preferTransport, (v) => {
+    try { localStorage.setItem(TRANSPORT_KEY, v === 'tcp' ? 'tcp' : 'auto') } catch {}
+    // When user forces TCP, force a keyframe on next send so viewers see the
+    // change instantly instead of waiting for the natural key cadence.
+    if (me.screenOn) vForceKey = true
+  })
+  // Session-scoped: viewer told us via `need-tcp` that WT looks broken from
+  // their side. Auto-fall-back until this share ends. Not persisted — a
+  // sharer restarting the share gets a fresh chance on WT.
+  const autoForcedTcp = ref(false)
+  const senderTransport = computed(() => {
+    if (preferTransport.value === 'tcp') return 'tcp-forced'
+    if (autoForcedTcp.value) return 'tcp-auto'
+    return (wt.value && wt.value.healthy.value) ? 'wt' : 'socket'
+  })
+  function useWtNow() {
+    if (preferTransport.value === 'tcp') return false
+    if (autoForcedTcp.value) return false
+    return !!(wt.value && wt.value.healthy.value)
+  }
   let wtInfo = null                          // { url, token } cached for reconnect
 
   const screenOptions = reactive({
@@ -646,6 +673,10 @@ export function useRoom(roomId, opts = {}) {
   let vFrameCount = 0
   let vForceKey = true
   let vBitrateBps = 3_000_000
+  // Codec strings any viewer told us they can't decode. Populated via the
+  // `codec-string-unsupported` socket event; passed to pickEncoderCodec so
+  // we never pick, say, avc1.640028 (H.264 High) again once it's failed.
+  const viewerRejectedCodecs = new Set()
   // VideoEncoder emits `meta.decoderConfig` only on the first output after
   // configure() (and on codec swaps). Cache it here so we can attach it to
   // *every* keyframe — otherwise late-joiners / refreshers get keyframes
@@ -656,6 +687,22 @@ export function useRoom(roomId, opts = {}) {
   // support different ones. We try them all in order.
   const CODEC_CANDIDATES = [
     { id: 'vp9',  label: 'VP9',   strings: ['vp09.00.10.08', 'vp09.00.31.08', 'vp09.02.10.10', 'vp9'] },
+    // HEVC (H.265). WebCodecs exposes this on Apple platforms + recent
+    // Chrome/Edge on hardware that supports it. Same profile@level game as
+    // H.264 — Main profile is what browsers actually decode; the last two
+    // hex digits are the general-level (L93=3.1, L120=4.0, L123=4.1,
+    // L150=5.0, L153=5.1).
+    // Both container flavors are worth probing: hvc1.* is the mp4-style
+    // in-band-config form Chrome/Safari prefer; hev1.* is the byte-stream
+    // form some browsers only expose that way. Try lower levels first for
+    // wider decoder support.
+    { id: 'hevc', label: 'HEVC',  strings: [
+      'hvc1.1.6.L93.B0',   'hev1.1.6.L93.B0',
+      'hvc1.1.6.L120.B0',  'hev1.1.6.L120.B0',
+      'hvc1.1.6.L123.B0',  'hev1.1.6.L123.B0',
+      'hvc1.1.6.L150.B0',  'hev1.1.6.L150.B0',
+      'hvc1.1.6.L153.B0',  'hev1.1.6.L153.B0'
+    ] },
     // H.264 profile/level strings, ordered by DECODER compatibility.
     //   42xxxx = Baseline (widest support — mobile Safari, older Android, etc.)
     //   4Dxxxx = Main    (still very broad)
@@ -685,7 +732,7 @@ export function useRoom(roomId, opts = {}) {
     { id: 'av1',  label: 'AV1',   strings: ['av01.0.04M.08'] }
   ]
 
-  async function pickEncoderCodec(width, height, framerate, bitrate, { strictFamily = false } = {}) {
+  async function pickEncoderCodec(width, height, framerate, bitrate, { strictFamily = false, avoidStrings = null } = {}) {
     // most encoders require even dimensions
     width = width - (width % 2)
     height = height - (height % 2)
@@ -700,6 +747,9 @@ export function useRoom(roomId, opts = {}) {
           ? [wantedCandidate]
           : [wantedCandidate, ...CODEC_CANDIDATES.filter((c) => c.id !== wanted)])
       : CODEC_CANDIDATES
+    // avoidStrings: specific codec strings the viewer already told us they
+    // can't decode. e.g. H.264 High 4.0 → skip and try Baseline / Main next.
+    const rejected = avoidStrings instanceof Set ? avoidStrings : new Set()
 
     // Progressively loosen constraints — some machines reject the strict combo.
     const optionSets = [
@@ -713,6 +763,7 @@ export function useRoom(roomId, opts = {}) {
     for (const opts of optionSets) {
       for (const c of ordered) {
         for (const codecStr of c.strings) {
+          if (rejected.has(codecStr)) continue
           const cfg = {
             codec: codecStr,
             width, height,
@@ -787,7 +838,7 @@ export function useRoom(roomId, opts = {}) {
       const fps = Math.min(60, Math.max(1, settings.frameRate || screenOptions.frameRate))
       vBitrateBps = Math.round(screenOptions.bitrate * 1_000_000)
 
-      const chosen = await pickEncoderCodec(width, height, fps, vBitrateBps)
+      const chosen = await pickEncoderCodec(width, height, fps, vBitrateBps, { avoidStrings: viewerRejectedCodecs })
       if (!chosen) {
         throw new Error('本机 WebCodecs 无可用编码器 · 详见 Console')
       }
@@ -865,6 +916,9 @@ export function useRoom(roomId, opts = {}) {
       vEncoder._h = height
       vEncoder._opts = chosen.opts
 
+      // Fresh share — reset any prior auto-fallback so we give WT a chance
+      // on this attempt. (Manual TCP preference stays sticky, obviously.)
+      autoForcedTcp.value = false
       me.screenOn = true
       activeScreenPeerId.value = 'me'
       broadcastState()
@@ -1043,7 +1097,11 @@ export function useRoom(roomId, opts = {}) {
   async function swapCodec(wanted) {
     if (!me.screenOn || !vEncoder) return
     const currentFamily = CODEC_FAMILY(vEncoder._codec)
-    if (currentFamily === wanted) {
+    // If we're already on the target family but the current SPECIFIC codec
+    // string got rejected, don't take the fast path — we must actually
+    // repick to land on a different profile/level inside the family.
+    const currentStringRejected = viewerRejectedCodecs.has(vEncoder._codec)
+    if (currentFamily === wanted && !currentStringRejected) {
       // Already on target — just force a keyframe so the requesting viewer
       // gets a fresh decoderConfig immediately.
       vForceKey = true
@@ -1060,7 +1118,13 @@ export function useRoom(roomId, opts = {}) {
       // strictFamily: viewer said "not this family" — we MUST honor that.
       // Silently picking the same family (or the family we just moved away from)
       // is what triggered the "swap codec h264 → vp8 avc1.640028" loop.
-      chosen = await pickEncoderCodec(w, h, fps, vBitrateBps, { strictFamily: true })
+      // avoidStrings: skip the exact codec strings the viewer already
+      // rejected — so H.264 High 4.0 failing lets us try H.264 Baseline 4.1
+      // instead of bailing to VP8.
+      chosen = await pickEncoderCodec(w, h, fps, vBitrateBps, {
+        strictFamily: true,
+        avoidStrings: viewerRejectedCodecs
+      })
     } finally {
       screenOptions.codec = savedPref
     }
@@ -1260,10 +1324,17 @@ export function useRoom(roomId, opts = {}) {
   const CODEC_FAMILY = (codec) => {
     if (codec.startsWith('vp09') || codec === 'vp9') return 'vp9'
     if (codec.startsWith('avc1') || codec.startsWith('avc3') || codec === 'h264') return 'h264'
+    if (codec.startsWith('hvc1') || codec.startsWith('hev1') || codec === 'hevc' || codec === 'h265') return 'hevc'
     if (codec === 'vp8' || codec.startsWith('vp08')) return 'vp8'
     if (codec.startsWith('av01') || codec === 'av1') return 'av1'
     return codec
   }
+
+  // Individual codec strings the viewer has rejected (H.264 High profile,
+  // HEVC Main 5.1, etc.). Separate from decoderSupport[family] because
+  // ONE H.264 profile failing doesn't mean H.264 is dead — Baseline might
+  // still work, we just need to tell the sharer to try that instead.
+  const rejectedCodecStrings = new Set()
 
   // Probe a decoder config against a cascade of hw/sw preferences. Returns
   // { supported, opts } so the caller can configure() with the *same* opts —
@@ -1327,10 +1398,12 @@ export function useRoom(roomId, opts = {}) {
     return dec
   }
 
-  // Cascade the sharer through H.264 → VP8 → AV1 → VP9 when the current codec
-  // isn't decodable. H.264 first because it's the most universally supported on
-  // mobile hardware.
-  const CODEC_FALLBACK_ORDER = ['h264', 'vp8', 'av1', 'vp9']
+  // Cascade the sharer through H.264 → HEVC → VP9 → AV1 → VP8 when the
+  // current codec isn't decodable. H.264 first because it's the most
+  // universally supported on mobile hardware. VP8 last — its software
+  // encoder produces essentially unwatchable output at 1080p, so we only
+  // land there when literally nothing else works.
+  const CODEC_FALLBACK_ORDER = ['h264', 'hevc', 'vp9', 'av1', 'vp8']
   function pickNextCodecTo(currentFamily) {
     for (const f of CODEC_FALLBACK_ORDER) {
       if (f === currentFamily) continue
@@ -1345,7 +1418,13 @@ export function useRoom(roomId, opts = {}) {
   function requestCodecSwitch(currentCodec) {
     if (!socket?.connected) return
     const family = CODEC_FAMILY(currentCodec)
-    decoderSupport[family] = false
+    // Remember the EXACT codec string that failed. A future probe of a
+    // different profile in the same family (H.264 Baseline vs High) should
+    // still be allowed.
+    rejectedCodecStrings.add(currentCodec)
+    // Tell the sharer which specific string failed — they'll skip it when
+    // repicking, letting them try a lower profile in the same family.
+    socket.emit('codec-string-unsupported', { codec: currentCodec })
     // Debounce per-family: even after we mark decoderSupport[family]=false,
     // in-flight chunks with an old config can arrive and re-trigger us. 2 s is
     // enough to cover a swap round-trip without blocking a genuine re-probe if
@@ -1354,16 +1433,12 @@ export function useRoom(roomId, opts = {}) {
     const last = lastSwitchRequestAt.get(family) || 0
     if (now - last < 2000) return
     lastSwitchRequestAt.set(family, now)
-    const wanted = pickNextCodecTo(family)
-    if (!wanted) {
-      // We've marked everything as unsupported — surrender.
-      decoderUnsupported.value = true
-      awaitingCodecSwitch.value = false
-      return
-    }
-    console.log('[webcodecs] requesting codec switch: current', family, 'wanted', wanted)
+    // Ask the sharer to try again in the same family first — they might have
+    // a lower profile available. Only if they can't produce anything in this
+    // family will they hit `codec-unavailable` and we'll cascade families.
+    console.log('[webcodecs] requesting codec re-probe: rejected', currentCodec, '— staying in family', family, 'if possible')
     awaitingCodecSwitch.value = true
-    socket.emit('need-codec', { avoid: family, wanted })
+    socket.emit('need-codec', { avoid: currentCodec, wanted: family, avoidString: currentCodec })
   }
 
   // Track per-peer receive rate for the screen video + audio streams. Rolling
@@ -1459,7 +1534,7 @@ export function useRoom(roomId, opts = {}) {
     return btoa(s)
   }
   function sendVideo(msg) {
-    if (wt.value?.healthy?.value) {
+    if (useWtNow()) {
       const meta = { type: msg.type }
       if (msg.config) {
         meta.config = {
@@ -1475,7 +1550,7 @@ export function useRoom(roomId, opts = {}) {
     if (socket?.connected) socket.emit('video', msg)
   }
   function sendScreenAudio(msg) {
-    if (wt.value?.healthy?.value) {
+    if (useWtNow()) {
       const meta = {
         type: msg.type,
         sampleRate: msg.sampleRate,
@@ -1634,6 +1709,7 @@ export function useRoom(roomId, opts = {}) {
           level: 0,
           micOn: !!p.micOn,
           screenOn: !!p.screenOn,
+          screenOnAt: p.screenOn ? performance.now() : 0,
           lastFrameTs: 0,
           rxScreen: 0,
           rxScreenAudio: 0,
@@ -1656,6 +1732,7 @@ export function useRoom(roomId, opts = {}) {
       peers.set(id, {
         id, name, level: 0,
         micOn: !!micOn, screenOn: !!screenOn,
+        screenOnAt: screenOn ? performance.now() : 0,
         lastFrameTs: 0,
         rxScreen: 0,
         rxScreenAudio: 0,
@@ -1679,6 +1756,7 @@ export function useRoom(roomId, opts = {}) {
       p.micOn = micOn
       const wasSharing = p.screenOn
       p.screenOn = screenOn
+      if (!wasSharing && screenOn) p.screenOnAt = performance.now()
       if (!screenOn && activeScreenPeerId.value === id) activeScreenPeerId.value = null
       if (screenOn && !activeScreenPeerId.value) activeScreenPeerId.value = id
       // A peer just started sharing — poke them so we get a keyframe right
@@ -1727,11 +1805,38 @@ export function useRoom(roomId, opts = {}) {
       wtInfo = info
       tryOpenWebTransport(info)
     })
-    socket.on('need-codec', ({ wanted }) => {
+    socket.on('need-codec', ({ wanted, avoidString }) => {
       if (!me.screenOn) return
+      // Viewer told us which specific string they rejected — record it before
+      // repicking so swapCodec doesn't hand back the same one.
+      if (typeof avoidString === 'string') viewerRejectedCodecs.add(avoidString)
       const target = typeof wanted === 'string' ? wanted : 'h264'
       swapCodec(target).catch((e) => console.warn('swapCodec failed', e))
     })
+    // A viewer told us a specific codec string can't decode. This is separate
+    // from `need-codec` because sometimes multiple viewers reject different
+    // strings — we just accumulate the set.
+    socket.on('codec-string-unsupported', ({ codec }) => {
+      if (typeof codec !== 'string') return
+      viewerRejectedCodecs.add(codec)
+      // If we're currently encoding a rejected string, re-pick immediately.
+      if (me.screenOn && vEncoder && vEncoder._codec === codec) {
+        const family = CODEC_FAMILY(codec)
+        swapCodec(family).catch((e) => console.warn('swapCodec (rejected string) failed', e))
+      }
+    })
+    // Viewer is saying: I see you sharing, but I'm not receiving frames —
+    // switch to plain socket.io. We drop out of WT for the rest of this share.
+    // A fresh screen-share start clears autoForcedTcp so the next attempt
+    // gets to try WT again.
+    socket.on('need-tcp', () => {
+      if (!me.screenOn) return
+      if (autoForcedTcp.value) return
+      console.warn('[transport] viewer requested TCP fallback — disabling WT for this share')
+      autoForcedTcp.value = true
+      vForceKey = true
+    })
+
     // Sharer told us they can't produce this codec. Mark it so pickNextCodecTo
     // skips it — otherwise we'd bounce right back with the same request.
     socket.on('codec-unavailable', ({ codec }) => {
@@ -1827,7 +1932,51 @@ export function useRoom(roomId, opts = {}) {
     if (socket) { try { socket.disconnect() } catch {} }
   }
 
-  onUnmounted(() => leave())
+  // Viewer-side stall watchdog: if a peer is marked screenOn but we've had
+  // no frames from them for a while, ask them to fall back to TCP. Fires at
+  // most once per stall — reset when frames start flowing again, or when the
+  // sharer stops sharing.
+  const STALL_MS = 3500                    // no-frame threshold before nagging
+  const NAG_COOLDOWN_MS = 8000             // don't spam need-tcp
+  const stallState = new Map()             // peerId -> { firstStallAt, lastNagAt }
+  const stallTimer = setInterval(() => {
+    if (!socket?.connected) return
+    const now = performance.now()
+    for (const p of peers.values()) {
+      if (!p.screenOn) { stallState.delete(p.id); continue }
+      const last = p.lastFrameTs || 0
+      // Never received a frame → measure gap from when screenOn flipped on.
+      if (!last) {
+        const startedAt = p.screenOnAt || now
+        const s = stallState.get(p.id) || { firstStallAt: startedAt, lastNagAt: 0 }
+        stallState.set(p.id, s)
+        if (now - s.firstStallAt > STALL_MS && now - s.lastNagAt > NAG_COOLDOWN_MS) {
+          console.warn('[transport] no frames from', p.id.slice(0, 6), '— asking sharer to switch to TCP')
+          socket.emit('need-tcp')
+          s.lastNagAt = now
+        }
+        continue
+      }
+      const gap = now - last
+      if (gap > STALL_MS) {
+        const s = stallState.get(p.id) || { firstStallAt: last, lastNagAt: 0 }
+        stallState.set(p.id, s)
+        if (now - s.lastNagAt > NAG_COOLDOWN_MS) {
+          console.warn('[transport] frames from', p.id.slice(0, 6), 'stalled', Math.round(gap), 'ms — asking sharer to switch to TCP')
+          socket.emit('need-tcp')
+          s.lastNagAt = now
+        }
+      } else {
+        // Frames flowing again — forget the stall record.
+        stallState.delete(p.id)
+      }
+    }
+  }, 1000)
+
+  onUnmounted(() => {
+    clearInterval(stallTimer)
+    leave()
+  })
   connect()
 
   const anyScreen = computed(() => {
@@ -1854,8 +2003,10 @@ export function useRoom(roomId, opts = {}) {
     hasEncoder: HAS_ENCODER,
     hasDecoder: HAS_DECODER,
     isSecure: IS_SECURE,
-    senderTransport,          // 'wt' | 'socket' — reactive
+    senderTransport,          // 'wt' | 'socket' | 'tcp-forced' | 'tcp-auto' — reactive
     hasWebTransport: HAS_WEBTRANSPORT,
+    preferTransport,          // ref: 'auto' | 'tcp' — user's manual preference (persisted)
+    autoForcedTcp,            // ref: session-only auto fallback flag
     toggleMic,
     toggleScreen,
     toggleDenoise,
