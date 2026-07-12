@@ -18,17 +18,32 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const distDir = path.join(rootDir, 'dist')
 
-// If SSL_CERT and SSL_KEY point at readable files, serve HTTPS directly —
-// no reverse proxy needed. Required for WebCodecs / getDisplayMedia /
-// getUserMedia to be exposed to the page (secure-context gate).
-const sslCertPath = process.env.SSL_CERT
-const sslKeyPath = process.env.SSL_KEY
+// Single source of truth: config.json at the repo root. Copy config.example.json
+// to config.json and edit. Missing file → sane HTTP defaults (relay-only, no WT).
+const cfgPath = path.join(rootDir, 'config.json')
+let cfg = {}
+if (fs.existsSync(cfgPath)) {
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    console.log(`[quick-talk] loaded config from ${cfgPath}`)
+  } catch (err) {
+    console.warn(`[quick-talk] config.json parse failed — using defaults:`, err.message)
+  }
+} else {
+  console.log(`[quick-talk] no config.json — using defaults (copy config.example.json to change)`)
+}
+
+const HOST = cfg.host || '0.0.0.0'
+const PORT = Number(cfg.port) || 3001
+
+// Load TLS cert if configured. HTTPS on the main port is required for browsers
+// to expose WebCodecs / getDisplayMedia / getUserMedia (secure-context gate).
 let httpsOptions = null
-if (sslCertPath && sslKeyPath) {
+if (cfg.ssl?.cert && cfg.ssl?.key) {
   try {
     httpsOptions = {
-      cert: fs.readFileSync(sslCertPath),
-      key: fs.readFileSync(sslKeyPath)
+      cert: fs.readFileSync(cfg.ssl.cert),
+      key: fs.readFileSync(cfg.ssl.key)
     }
   } catch (err) {
     console.warn(`[quick-talk] SSL cert/key unreadable — falling back to HTTP:`, err.message)
@@ -75,13 +90,12 @@ if (fs.existsSync(distDir)) {
 const rooms = new Map()
 
 // Optionally spin up a WebTransport relay alongside socket.io. Enabled when
-// WEBTRANSPORT_PORT is set AND we have a TLS cert. Clients auto-detect via a
-// server-issued token during join; if WT is off the frontend silently keeps
+// config.webtransport.port > 0 AND we have a TLS cert. Clients auto-detect via
+// a server-issued token during join; if WT is off the frontend silently keeps
 // using socket.io for everything.
-const wtPort = Number(process.env.WEBTRANSPORT_PORT || 0)
-const wtHost = process.env.WEBTRANSPORT_HOST || HOST_default()
-const wtPublicUrl = process.env.WEBTRANSPORT_PUBLIC_URL || null
-function HOST_default() { return process.env.HOST || '0.0.0.0' }
+const wtPort = Number(cfg.webtransport?.port) || 0
+const wtHost = cfg.webtransport?.host || HOST
+const wtPublicUrl = cfg.webtransport?.publicUrl || null
 
 let wt = null
 if (wtPort > 0 && httpsOptions) {
@@ -102,7 +116,7 @@ if (wtPort > 0 && httpsOptions) {
     wt = null
   }
 } else if (wtPort > 0) {
-  console.warn('[quick-talk] WEBTRANSPORT_PORT set but no SSL_CERT/SSL_KEY — WT needs TLS')
+  console.warn('[quick-talk] webtransport.port set but no ssl.cert/ssl.key — WT needs TLS')
 }
 
 function serialise(members, exceptId) {
@@ -227,8 +241,6 @@ io.on('connection', (socket) => {
   })
 })
 
-const PORT = process.env.PORT || 3001
-const HOST = process.env.HOST || '0.0.0.0'
 const servesSpa = fs.existsSync(distDir)
 const scheme = httpsOptions ? 'https' : 'http'
 server.listen(PORT, HOST, () => {
@@ -237,7 +249,7 @@ server.listen(PORT, HOST, () => {
   if (!httpsOptions && HOST !== '127.0.0.1' && HOST !== 'localhost') {
     console.log('[quick-talk] ⚠  HTTP mode — WebCodecs / getUserMedia will be')
     console.log('[quick-talk]    disabled by the browser once you leave localhost.')
-    console.log('[quick-talk]    Set SSL_CERT and SSL_KEY, or put HTTPS in front (Caddy/Nginx).')
+    console.log('[quick-talk]    Set ssl.cert / ssl.key in config.json, or put HTTPS in front.')
   }
   import('os').then(({ networkInterfaces }) => {
     const nets = networkInterfaces()

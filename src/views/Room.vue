@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useRoom } from '../composables/useRoom.js'
 import Participant from '../components/Participant.vue'
 import ScreenView from '../components/ScreenView.vue'
+import AudioMixer from '../components/AudioMixer.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -22,6 +23,14 @@ const pendingImage = ref(null)     // { dataUrl, w, h, size } — attached but n
 const fileInputEl = ref(null)
 const lightboxSrc = ref(null)      // dataUrl currently expanded
 const disconnectDismissed = ref(false)
+const mixerOpen = ref(false)
+
+function toggleMixer() { mixerOpen.value = !mixerOpen.value }
+function closeMixerOutside(e) {
+  if (!mixerOpen.value) return
+  const el = document.querySelector('.mixer-anchor')
+  if (el && !el.contains(e.target)) mixerOpen.value = false
+}
 
 const RESOLUTIONS = [
   { key: '720p',  label: '720p',  hint: '1280 × 720' },
@@ -292,6 +301,7 @@ onMounted(() => {
   window.addEventListener('resize', onResize)
   window.addEventListener('keydown', onKey)
   window.addEventListener('mousedown', closeScreenMenuOutside)
+  window.addEventListener('mousedown', closeMixerOutside)
 })
 
 watch(() => room.screenOptions.frameRate, () => room.retimeScreen())
@@ -300,6 +310,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', onResize)
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('mousedown', closeScreenMenuOutside)
+  window.removeEventListener('mousedown', closeMixerOutside)
 })
 </script>
 
@@ -347,6 +358,41 @@ onUnmounted(() => {
           <span class="pip" :class="{ on: room.connection.value === 'connected' }"></span>
           <span class="mono status-text">{{ statusLabel }}</span>
         </span>
+        <div class="mixer-anchor">
+          <button
+            class="mixer-btn"
+            :class="{ open: mixerOpen }"
+            @click="toggleMixer"
+            :title="mixerOpen ? '关闭混音器' : '音量混合器'"
+            aria-haspopup="dialog"
+            :aria-expanded="mixerOpen"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 10v4M4 4v3M4 17v3" />
+              <path d="M12 8v10M12 4v2" />
+              <path d="M20 14v4M20 4v7" />
+              <circle cx="4" cy="12" r="1.6" />
+              <circle cx="12" cy="6" r="1.6" />
+              <circle cx="20" cy="12.5" r="1.6" />
+            </svg>
+            <span class="mixer-lbl">音量</span>
+          </button>
+          <transition name="mixer-pop">
+            <div v-if="mixerOpen" class="mixer-panel" @mousedown.stop>
+              <AudioMixer
+                :master-voice="room.masterVoiceVolume"
+                :master-screen="room.masterScreenVolume"
+                :peers="room.peers"
+                :peer-audio="room.peerAudio"
+                :set-peer-voice="room.setPeerVoiceVolume"
+                :set-peer-screen="room.setPeerScreenVolume"
+                :set-peer-muted="room.setPeerMuted"
+                :ensure-peer="room.getPeerAudio"
+                @close="mixerOpen = false"
+              />
+            </div>
+          </transition>
+        </div>
         <button class="leave-btn" @click="leaveRoom" title="离开房间">
           <span class="leave-icon">↩</span>
           <span>离开</span>
@@ -893,6 +939,48 @@ onUnmounted(() => {
 @media (max-width: 520px) {
   .share-btn .share-lbl { display: none; }
   .share-btn { padding: 8px 10px; }
+}
+
+/* ============= mixer button + panel ============= */
+.mixer-anchor { position: relative; }
+.mixer-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text-2);
+  background: var(--panel);
+  font-size: 12px;
+  transition: color 160ms var(--ease), border-color 160ms var(--ease), background 160ms var(--ease);
+}
+.mixer-btn svg { width: 15px; height: 15px; }
+.mixer-btn:hover,
+.mixer-btn.open {
+  color: var(--cool);
+  border-color: var(--cool);
+  background: var(--panel-2);
+}
+.mixer-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 40;
+}
+.mixer-pop-enter-active,
+.mixer-pop-leave-active {
+  transition: opacity 160ms var(--ease), transform 160ms var(--ease);
+}
+.mixer-pop-enter-from,
+.mixer-pop-leave-to {
+  opacity: 0;
+  transform: translateY(-6px);
+}
+@media (max-width: 520px) {
+  .mixer-btn .mixer-lbl { display: none; }
+  .mixer-btn { padding: 8px 10px; }
+  .mixer-panel { right: -6px; }
 }
 
 /* ============= disconnect banner ============= */

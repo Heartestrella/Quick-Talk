@@ -3,7 +3,7 @@
 // Screen: WebCodecs VP9/VP8/H.264 encoded chunks (delta-frame compressed).
 // Nothing is P2P — every packet passes through the Node.js relay server.
 
-import { reactive, ref, shallowRef, onUnmounted, computed } from 'vue'
+import { reactive, ref, shallowRef, onUnmounted, computed, watch } from 'vue'
 import { io } from 'socket.io-client'
 import { openWebTransport, WT_KIND } from './useTransport.js'
 
@@ -85,6 +85,96 @@ export function useRoom(roomId) {
   let captureNode = null              // AudioWorkletNode running pcm-worklet.js
   const nextPlayAt = new Map()        // peerId -> AudioContext currentTime for next chunk
   const remoteGains = new Map()       // peerId -> GainNode (per-peer volume + analyser hook)
+
+  // ---------- mixer: master + per-peer volume / mute ----------
+  // Voice and screen-audio each get a master GainNode that all per-peer gains
+  // feed into. So the graph is:
+  //     per-peer source → per-peer GainNode → masterGain → destination
+  // Voice runs at 16 kHz on audioCtx, screen audio runs at 48 kHz on
+  // screenAudioCtx; each has its OWN master node.
+  const VOLUME_MAX = 1.5              // allow a slight boost above 100 %
+  const AUDIO_STORAGE_KEY = 'qt.audio.v2'
+  const clampVol = (n) => Math.max(0, Math.min(VOLUME_MAX, Number(n) || 0))
+
+  const persistedMaster = (() => {
+    try {
+      const raw = localStorage.getItem(AUDIO_STORAGE_KEY)
+      if (!raw) return { voice: 1, screen: 1 }
+      const j = JSON.parse(raw)
+      return { voice: clampVol(j.voice ?? 1), screen: clampVol(j.screen ?? 1) }
+    } catch { return { voice: 1, screen: 1 } }
+  })()
+
+  const masterVoiceVolume = ref(persistedMaster.voice)
+  const masterScreenVolume = ref(persistedMaster.screen)
+  // peerId -> { voice, screen, muted } — in-memory only (socket.id changes on
+  // reconnect so persisting per-peer would leak/misapply).
+  const peerAudio = reactive(new Map())
+
+  let voiceMasterGain = null
+  let screenMasterGain = null
+  function ensureVoiceMaster() {
+    if (voiceMasterGain || !audioCtx) return voiceMasterGain
+    voiceMasterGain = audioCtx.createGain()
+    voiceMasterGain.gain.value = masterVoiceVolume.value
+    voiceMasterGain.connect(audioCtx.destination)
+    return voiceMasterGain
+  }
+  function ensureScreenMaster() {
+    if (screenMasterGain || !screenAudioCtx) return screenMasterGain
+    screenMasterGain = screenAudioCtx.createGain()
+    screenMasterGain.gain.value = masterScreenVolume.value
+    screenMasterGain.connect(screenAudioCtx.destination)
+    return screenMasterGain
+  }
+  function getPeerAudio(id) {
+    let s = peerAudio.get(id)
+    if (!s) { s = { voice: 1, screen: 1, muted: false }; peerAudio.set(id, s) }
+    return s
+  }
+  function applyPeerVoiceGain(id) {
+    const g = remoteGains.get(id); if (!g) return
+    const s = getPeerAudio(id)
+    g.gain.value = s.muted ? 0 : s.voice
+  }
+  function applyPeerScreenGain(id) {
+    const g = screenAudioGains.get(id); if (!g) return
+    const s = getPeerAudio(id)
+    g.gain.value = s.muted ? 0 : s.screen
+  }
+  function setMasterVoiceVolume(v) { masterVoiceVolume.value = clampVol(v) }
+  function setMasterScreenVolume(v) { masterScreenVolume.value = clampVol(v) }
+  function setPeerVoiceVolume(id, v) {
+    getPeerAudio(id).voice = clampVol(v)
+    applyPeerVoiceGain(id)
+  }
+  function setPeerScreenVolume(id, v) {
+    getPeerAudio(id).screen = clampVol(v)
+    applyPeerScreenGain(id)
+  }
+  function setPeerMuted(id, muted) {
+    getPeerAudio(id).muted = !!muted
+    applyPeerVoiceGain(id)
+    applyPeerScreenGain(id)
+  }
+  function persistMaster() {
+    try {
+      localStorage.setItem(AUDIO_STORAGE_KEY, JSON.stringify({
+        voice: masterVoiceVolume.value,
+        screen: masterScreenVolume.value
+      }))
+    } catch {}
+  }
+  // Push master value into the live gain node + persist on any change.
+  watch(masterVoiceVolume, (v) => {
+    if (voiceMasterGain) voiceMasterGain.gain.value = v
+    persistMaster()
+  })
+  watch(masterScreenVolume, (v) => {
+    if (screenMasterGain) screenMasterGain.gain.value = v
+    persistMaster()
+  })
+
   // audioWorklet.addModule() must run once per AudioContext before we can
   // construct AudioWorkletNode. Two paths create the context: enabling the
   // mic (ensureAudioCtx) and receiving remote voice (playPcm). If a peer
@@ -292,12 +382,19 @@ export function useRoom(roomId) {
       audioCtx.resume().catch(() => { needsAudioUnlock.value = true })
     }
     const int16 = new Int16Array(arrayBuf)
-    // per-peer gain lets us route into a shared analyser for waveform if we want
+    // per-peer gain → master gain → destination.  Setting up the master lazily
+    // here (rather than at ctx creation) keeps the graph identical for peers
+    // that never speak.
     let gain = remoteGains.get(from)
     if (!gain) {
       gain = audioCtx.createGain()
-      gain.connect(audioCtx.destination)
+      const master = ensureVoiceMaster()
+      gain.connect(master || audioCtx.destination)
       remoteGains.set(from, gain)
+      // Apply any pre-existing per-peer setting (e.g. user muted this peer
+      // before their first voice packet arrived).
+      const s = getPeerAudio(from)
+      gain.gain.value = s.muted ? 0 : s.voice
     }
     // level for waveform (cheap RMS)
     let sum = 0
@@ -867,8 +964,11 @@ export function useRoom(roomId) {
       let gain = screenAudioGains.get(from)
       if (!gain) {
         gain = ctx.createGain()
-        gain.connect(ctx.destination)
+        const master = ensureScreenMaster()
+        gain.connect(master || ctx.destination)
         screenAudioGains.set(from, gain)
+        const s = getPeerAudio(from)
+        gain.gain.value = s.muted ? 0 : s.screen
       }
       dec = new AudioDecoder({
         output: (data) => {
@@ -1345,6 +1445,7 @@ export function useRoom(roomId) {
     const ag = screenAudioGains.get(id)
     if (ag) { try { ag.disconnect() } catch {}; screenAudioGains.delete(id) }
     screenAudioNext.delete(id)
+    peerAudio.delete(id)
     if (activeScreenPeerId.value === id) activeScreenPeerId.value = null
   }
 
@@ -1429,6 +1530,17 @@ export function useRoom(roomId) {
     applyBitrate,
     retimeScreen,
     focusScreen,
-    leave
+    leave,
+
+    // ---------- mixer ----------
+    masterVoiceVolume,
+    masterScreenVolume,
+    peerAudio,                       // reactive Map<peerId, { voice, screen, muted }>
+    setMasterVoiceVolume,
+    setMasterScreenVolume,
+    setPeerVoiceVolume,
+    setPeerScreenVolume,
+    setPeerMuted,
+    getPeerAudio                     // ensures + returns { voice, screen, muted }
   }
 }
