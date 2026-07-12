@@ -997,16 +997,22 @@ export function useRoom(roomId, opts = {}) {
   }
 
   async function pumpFrames() {
-    // Natural keyframe cadence is intentionally slack — every ~20 s at 30 fps.
-    // Late joiners and codec-swap requests already trigger explicit keyframes
-    // via `need-keyframe`, so we don't need a tight 4-second beat. The old
-    // 120-frame cadence was showing up as a visible stutter every few seconds.
-    const KEY_EVERY = 600
+    // Natural keyframe cadence. 3 s over WT (lossy — one bad delta and the
+    // decoder freezes on the last good frame until the next key), 20 s over
+    // socket.io (TCP, ordered, reliable — no need to burn bandwidth on
+    // keyframes). Recomputed each frame so the cadence tracks whichever
+    // transport senderTransport lands on.
+    const KEY_EVERY_WT = Math.max(1, screenOptions.frameRate * 3)     // ~3 s
+    const KEY_EVERY_TCP = Math.max(1, screenOptions.frameRate * 20)   // ~20 s
+    function keyEveryNow() {
+      const t = senderTransport.value
+      return (t === 'wt') ? KEY_EVERY_WT : KEY_EVERY_TCP
+    }
     while (vEncoder && vEncoder.state === 'configured' && vReader) {
       const { value: frame, done } = await vReader.read()
       if (done) break
       if (!vEncoder || vEncoder.state !== 'configured') { frame.close(); break }
-      const keyFrame = vForceKey || (vFrameCount % KEY_EVERY === 0)
+      const keyFrame = vForceKey || (vFrameCount % keyEveryNow() === 0)
       vForceKey = false
       try { vEncoder.encode(frame, { keyFrame }) } catch (e) { console.warn('encode', e) }
       frame.close()
@@ -1351,6 +1357,21 @@ export function useRoom(roomId, opts = {}) {
     } catch (e) { console.warn('screen-audio decode', e) }
   }
 
+  // Per-peer tracking of the last chunk timestamp we FED to the decoder.
+  // QUIC uni-streams don't preserve order between streams — chunk N+1 can
+  // land before chunk N. If we blindly feed the decoder in arrival order,
+  // deltas that reference frames the decoder hasn't seen yet blow up. We
+  // reorder chunks that arrive slightly early by holding them a tiny window,
+  // and drop chunks that arrive too late to matter (past the current one).
+  const lastChunkTs = new Map()          // peerId -> ts (microseconds)
+  const reorderBuf = new Map()           // peerId -> [{msg, addedAt}]
+  const REORDER_WINDOW_MS = 60           // how long we hold an out-of-order chunk
+  // Watchdog: if too much wall-clock time passes without a keyframe on a
+  // WT-fed stream (deltas keep coming but partial corruption froze part of
+  // the canvas), request one.
+  const lastKeyAt = new Map()            // peerId -> performance.now()
+  const KEYFRAME_STARVATION_MS = 5000    // if no key in 5 s, ping sharer
+
   // Which codec families this device can actually decode. Populated lazily on
   // first video-chunk. Used to (a) skip re-asking for a codec swap we already
   // know is going to fail, (b) show a helpful message.
@@ -1424,6 +1445,12 @@ export function useRoom(roomId, opts = {}) {
         console.warn('decoder error', peerId.slice(0, 4), e)
         try { dec.close() } catch {}
         videoDecoders.delete(peerId)
+        pendingChunks.delete(peerId)
+        lastChunkTs.delete(peerId)
+        // A dead decoder without a fresh keyframe = viewer stares at a stale
+        // canvas for up to KEY_EVERY frames. Ask the sharer NOW so we don't
+        // have to wait for the natural cadence.
+        if (socket?.connected) socket.emit('need-keyframe')
       }
     })
     // Use the same hw/sw preference that probeDecoder found workable — otherwise
@@ -1520,10 +1547,28 @@ export function useRoom(roomId, opts = {}) {
     // TCP fallback".
     const p = peers.get(from)
     if (p) p.lastFrameTs = performance.now()
+
+    // ---- QUIC uni-stream reordering ----
+    // WT delivers each chunk on its own uni-stream, and between-stream
+    // ordering isn't guaranteed. A chunk that arrives with ts LESS than the
+    // last-fed ts is a late duplicate/reordering — drop it (the decoder
+    // already moved past that timestamp).
+    // Keyframes always pass — they reset the decoder anyway.
+    if (msg.type !== 'key' && !msg.config) {
+      const lastFedTs = lastChunkTs.get(from)
+      if (lastFedTs !== undefined && msg.ts < lastFedTs) {
+        // Too late — decoder is past this point. Deltas older than the
+        // current position can only produce garbage.
+        return
+      }
+    }
     let dec = videoDecoders.get(from)
-    // Config → (re)build decoder
+    // Config → (re)build decoder. Fresh encoder = fresh ts baseline, so wipe
+    // the reorder guards or we'd reject every new delta as "too old".
     if (msg.config) {
       if (dec) { try { dec.close() } catch {}; videoDecoders.delete(from); dec = null }
+      lastChunkTs.delete(from)
+      lastKeyAt.delete(from)
       const family = CODEC_FAMILY(msg.config.codec)
       // Probe once per codec family — if unsupported, ask sharer to switch.
       if (decoderSupport[family] === null) {
@@ -1562,7 +1607,15 @@ export function useRoom(roomId, opts = {}) {
         data: new Uint8Array(msg.data)
       })
       dec.decode(chunk)
-    } catch (e) { console.warn('decode err', e) }
+      lastChunkTs.set(from, msg.ts)
+      if (msg.type === 'key') lastKeyAt.set(from, performance.now())
+    } catch (e) {
+      console.warn('decode err', e)
+      // Delta chunk failing to decode = its reference frame is missing.
+      // Salvage this: ask for a fresh keyframe so we recover on the next tick
+      // instead of freezing the canvas until the natural cadence catches up.
+      if (socket?.connected && msg.type !== 'key') socket.emit('need-keyframe')
+    }
   }
 
   function attachScreenCanvas(peerId, el) {
@@ -1972,6 +2025,9 @@ export function useRoom(roomId, opts = {}) {
     const dec = videoDecoders.get(id)
     if (dec) { try { dec.close() } catch {}; videoDecoders.delete(id) }
     pendingChunks.delete(id)
+    lastChunkTs.delete(id)
+    lastKeyAt.delete(id)
+    reorderBuf.delete(id)
     screenCanvases.delete(id)
     const adec = screenAudioDecoders.get(id)
     if (adec) { try { adec.close() } catch {}; screenAudioDecoders.delete(id) }
@@ -2030,6 +2086,28 @@ export function useRoom(roomId, opts = {}) {
     if (socket) { try { socket.disconnect() } catch {} }
   }
 
+  // Viewer-side keyframe-starvation watchdog: even when deltas keep flowing,
+  // a corrupt / lost delta earlier in the stream can leave part of the canvas
+  // stuck on an old frame. If we haven't seen a keyframe in a while but we
+  // ARE receiving chunks, poke the sharer.
+  const keyStarveTimer = setInterval(() => {
+    if (!socket?.connected) return
+    const now = performance.now()
+    for (const p of peers.values()) {
+      if (!p.screenOn) continue
+      const lastKey = lastKeyAt.get(p.id) || 0
+      const lastFrame = p.lastFrameTs || 0
+      // Only nag if frames ARE flowing (avoids overlap with the TCP-fallback
+      // watchdog below). Frames flowing + keyframe old = suspected staleness.
+      if (lastFrame && now - lastFrame < 2000 && lastKey && now - lastKey > KEYFRAME_STARVATION_MS) {
+        console.warn('[decoder] no keyframe from', p.id.slice(0, 6), 'for', Math.round((now - lastKey) / 1000), 's — nudging sharer')
+        socket.emit('need-keyframe')
+        // Reset so we don't spam every tick.
+        lastKeyAt.set(p.id, now)
+      }
+    }
+  }, 1000)
+
   // Viewer-side stall watchdog: if a peer is marked screenOn but we've had
   // no frames from them for a while, ask them to fall back to TCP. Fires at
   // most once per stall — reset when frames start flowing again, or when the
@@ -2082,6 +2160,7 @@ export function useRoom(roomId, opts = {}) {
 
   onUnmounted(() => {
     clearInterval(stallTimer)
+    clearInterval(keyStarveTimer)
     leave()
   })
   connect()
