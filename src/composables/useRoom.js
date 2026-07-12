@@ -1746,8 +1746,27 @@ export function useRoom(roomId, opts = {}) {
   }
 
   // ---------- WT open + incoming chunk demux ----------
+  // Attempt tracking — retry with exponential-ish backoff while the user
+  // wants WT but it's not up. Cleared on success / when user switches to
+  // TCP-only preference.
+  let wtOpenInFlight = false
+  let wtRetryTimer = null
+  function scheduleWtRetry(delayMs) {
+    if (wtRetryTimer) return
+    wtRetryTimer = setTimeout(() => {
+      wtRetryTimer = null
+      if (preferTransport.value !== 'wt') return
+      if (wt.value) return
+      if (!wtInfo) return
+      tryOpenWebTransport(wtInfo).catch(() => {})
+    }, delayMs)
+  }
   async function tryOpenWebTransport(info) {
     if (!HAS_WEBTRANSPORT || !info?.url || !info?.token || !me.id) return
+    // Guard against parallel opens (e.g. user toggles preference while a
+    // scheduled retry hasn't fired yet).
+    if (wtOpenInFlight) return
+    wtOpenInFlight = true
     // Close a stale session before starting a new one.
     if (wt.value) { try { wt.value.close() } catch {}; wt.value = null }
     const opened = await openWebTransport({
@@ -1756,15 +1775,39 @@ export function useRoom(roomId, opts = {}) {
       token: info.token,
       room: roomId,
       onChunk: onWtChunk,
-      onClose: () => { if (wt.value === opened) wt.value = null }
+      onClose: () => {
+        if (wt.value === opened) wt.value = null
+        // Session died. If user still wants WT, schedule a retry so we can
+        // reconnect once the network / server recovers.
+        if (preferTransport.value === 'wt') scheduleWtRetry(5000)
+      }
     })
+    wtOpenInFlight = false
     if (opened) {
       wt.value = opened
       console.log('[wt] session up')
     } else {
-      console.log('[wt] open failed — staying on socket.io')
+      console.log('[wt] open failed — falling back to socket.io (data still flows over TCP)')
+      // If user prefers WT, keep trying quietly in the background so the
+      // moment their UDP path recovers, we resume QUIC without needing them
+      // to toggle anything.
+      if (preferTransport.value === 'wt') scheduleWtRetry(8000)
     }
   }
+
+  // React to user flipping preferTransport → 'wt' after we've already been
+  // running: try opening a session if we don't have one.
+  watch(preferTransport, (v) => {
+    if (v === 'wt' && !wt.value && wtInfo) {
+      tryOpenWebTransport(wtInfo).catch(() => {})
+    }
+    // Switching back to TCP → cancel pending retries so we stop pinging the
+    // dead endpoint on a schedule.
+    if (v !== 'wt' && wtRetryTimer) {
+      clearTimeout(wtRetryTimer)
+      wtRetryTimer = null
+    }
+  })
 
   function onWtChunk(from, kind, ts, meta, payload) {
     if (!from) return

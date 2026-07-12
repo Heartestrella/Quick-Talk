@@ -60,11 +60,13 @@ function cancelRename() {
 }
 
 // Transport chip — two states: TCP (default, reliable) ↔ UDP (QUIC / WT,
-// low-latency but picture may tear).
+// low-latency but picture may tear). When UDP is picked but the WT session
+// can't be established (server / firewall blocks 4433), data silently keeps
+// flowing over socket.io — chip surfaces that as "UDP · TCP 备用".
 const transportLabel = computed(() => {
   switch (room.senderTransport.value) {
     case 'wt':          return 'UDP · QUIC'
-    case 'wt-degraded': return 'UDP · 无连接'
+    case 'wt-degraded': return 'UDP · TCP 备用'
     default:            return 'TCP'
   }
 })
@@ -75,8 +77,9 @@ const transportClass = computed(() => {
   return 'tp-tcp'
 })
 const transportTitle = computed(() => {
-  const pref = room.preferTransport.value
-  if (pref === 'wt') return 'UDP / QUIC 模式 · 画面可能撕裂 · 点击切回 TCP'
+  const t = room.senderTransport.value
+  if (t === 'wt') return 'UDP / QUIC 直传 · 画面可能撕裂 · 点击切回 TCP'
+  if (t === 'wt-degraded') return 'UDP 通道未建立（服务器/防火墙未通）· 数据实走 TCP 备用 · 后台会自动重试 WT · 点击切回 TCP'
   return 'TCP 模式（默认，稳）· 点击切 UDP（更低延迟，可能撕裂）'
 })
 function toggleTransport() {
