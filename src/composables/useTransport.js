@@ -81,6 +81,11 @@ export async function openWebTransport(opts) {
   }
 
   // -------- read incoming uni-streams (screen chunks from server) --------
+  // Track how many chunks actually reach us via WT — the sharer's send-side
+  // stats can look 100% healthy while the server→viewer UDP path silently
+  // drops everything. If this stays at 0 while `[wt] session up` was logged,
+  // the receive-side UDP is broken.
+  const rxStats = { chunks: 0, bytes: 0, lastLogAt: 0 }
   ;(async () => {
     const reader = wt.incomingUnidirectionalStreams.getReader()
     while (!closed) {
@@ -92,6 +97,17 @@ export async function openWebTransport(opts) {
         if (!u8 || u8.byteLength < 11) return
         const dec = decodeChunk(u8)
         if (!dec) return
+        rxStats.chunks++
+        rxStats.bytes += u8.byteLength
+        const now = performance.now()
+        if (now - rxStats.lastLogAt > 1000) {
+          if (rxStats.chunks > 0) {
+            console.log(`[wt] recv chunks=${rxStats.chunks} bytes=${rxStats.bytes}`)
+          }
+          rxStats.chunks = 0
+          rxStats.bytes = 0
+          rxStats.lastLogAt = now
+        }
         // The server unwraps `from` on the socket.io path; on WT we don't
         // (yet) tag the peer id per-stream because the server only fans out
         // chunks that came from the ORIGINAL sender's session, so who "from"

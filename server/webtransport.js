@@ -184,6 +184,26 @@ async function readUniStreams(session, fromPeerId, room, ctx) {
   }
 }
 
+// Per-peer fan-out stats. Rolls every ~2 s and logs so the operator can see
+// exactly which viewer's WT downlink is failing. Only counts sharer→server
+// chunks that we tried to forward — a session that never receives anything
+// won't spam the log.
+const fanoutStats = new Map()   // toPeerId -> { ok, fail, lastLogAt }
+function trackFanout(toPeerId, ok) {
+  let s = fanoutStats.get(toPeerId)
+  if (!s) { s = { ok: 0, fail: 0, lastLogAt: Date.now() }; fanoutStats.set(toPeerId, s) }
+  if (ok) s.ok++; else s.fail++
+  const now = Date.now()
+  if (now - s.lastLogAt > 2000) {
+    const total = s.ok + s.fail
+    const failPct = total ? Math.round(100 * s.fail / total) : 0
+    console.log(`[wt] fan-out → ${toPeerId.slice(0, 6)}  ok=${s.ok} fail=${s.fail} (${failPct}% loss)`)
+    s.ok = 0
+    s.fail = 0
+    s.lastLogAt = now
+  }
+}
+
 async function handleIncomingChunk(uniReadable, fromPeerId, room, ctx) {
   const buf = await readAll(uniReadable, MAX_CHUNK_BYTES)
   if (!buf || buf.byteLength < 11) return
@@ -210,8 +230,20 @@ async function handleIncomingChunk(uniReadable, fromPeerId, room, ctx) {
   for (const memberId of wtReceivers) {
     const sess = ctx.wtSessions.get(memberId)
     if (!sess) continue
-    writeUniStream(sess, rewritten).catch((e) =>
-      console.warn('[wt] fan-out to', memberId.slice(0, 6), 'failed', e?.message)
+    writeUniStream(sess, rewritten).then(
+      () => trackFanout(memberId, true),
+      (e) => {
+        trackFanout(memberId, false)
+        // If a fan-out to a specific peer fails a bunch, also relay via
+        // socket.io so the viewer doesn't just stare at a black screen —
+        // one uni-stream failure doesn't mean the whole WT session is dead,
+        // but the viewer's watchdog will still nag `need-tcp` if this keeps
+        // up. Better to lose latency than lose the frame.
+        const socketMsg = buildSocketMsg(decoded)
+        const event = decoded.kind === KIND_VIDEO ? 'video' : 'screen-audio'
+        try { ctx.io.to(memberId).emit(event, fromPeerId, socketMsg) } catch {}
+        console.warn('[wt] fan-out to', memberId.slice(0, 6), 'failed —', e?.message, '· mirrored via socket.io')
+      }
     )
   }
 
