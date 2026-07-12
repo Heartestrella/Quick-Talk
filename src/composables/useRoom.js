@@ -120,31 +120,51 @@ export function useRoom(roomId, opts = {}) {
   // User preference — 'auto' (default: use WT when healthy) or 'tcp' (never
   // use WT). Persisted so a user who has decided QUIC is worse on their
   // network doesn't have to flip it every session.
+  //   'auto' — use WT when healthy, fall back to socket on stall (default)
+  //   'tcp'  — never use WT, no matter what
+  //   'wt'   — always try WT, DO NOT auto-fall-back (for debugging UDP)
   const TRANSPORT_KEY = 'qt.transport'
   const preferTransport = ref((() => {
     try {
       const v = localStorage.getItem(TRANSPORT_KEY)
-      return v === 'tcp' ? 'tcp' : 'auto'
+      if (v === 'tcp' || v === 'wt') return v
+      return 'auto'
     } catch { return 'auto' }
   })())
   watch(preferTransport, (v) => {
-    try { localStorage.setItem(TRANSPORT_KEY, v === 'tcp' ? 'tcp' : 'auto') } catch {}
-    // When user forces TCP, force a keyframe on next send so viewers see the
-    // change instantly instead of waiting for the natural key cadence.
+    try {
+      const clean = v === 'tcp' || v === 'wt' ? v : 'auto'
+      localStorage.setItem(TRANSPORT_KEY, clean)
+    } catch {}
+    // Any preference change → force a keyframe so viewers see it immediately
+    // rather than waiting up to 20 s for the natural cadence.
     if (me.screenOn) vForceKey = true
+    // Bumping OUT of auto-forced (e.g. user manually re-picks 'wt' or 'auto')
+    // clears the session-scoped fallback so WT gets another chance.
+    if (v === 'wt') autoForcedTcp.value = false
   })
   // Session-scoped: viewer told us via `need-tcp` that WT looks broken from
   // their side. Auto-fall-back until this share ends. Not persisted — a
   // sharer restarting the share gets a fresh chance on WT.
   const autoForcedTcp = ref(false)
+  // Human-readable reason the transport got forced. Shown in the UI tooltip
+  // so users can see WHY it happened, not just that it happened.
+  const autoForcedReason = ref('')
   const senderTransport = computed(() => {
     if (preferTransport.value === 'tcp') return 'tcp-forced'
+    if (preferTransport.value === 'wt') {
+      // User wants WT no matter what — if it's not healthy, we still
+      // technically emit through socket (data > protocol purity), but the
+      // chip stays 'wt' so they know their preference isn't being subverted.
+      return (wt.value && wt.value.healthy.value) ? 'wt' : 'wt-degraded'
+    }
     if (autoForcedTcp.value) return 'tcp-auto'
     return (wt.value && wt.value.healthy.value) ? 'wt' : 'socket'
   })
   function useWtNow() {
     if (preferTransport.value === 'tcp') return false
-    if (autoForcedTcp.value) return false
+    // 'wt' preference skips autoForcedTcp — user wants raw WT for debugging.
+    if (preferTransport.value !== 'wt' && autoForcedTcp.value) return false
     return !!(wt.value && wt.value.healthy.value)
   }
   let wtInfo = null                          // { url, token } cached for reconnect
@@ -919,6 +939,7 @@ export function useRoom(roomId, opts = {}) {
       // Fresh share — reset any prior auto-fallback so we give WT a chance
       // on this attempt. (Manual TCP preference stays sticky, obviously.)
       autoForcedTcp.value = false
+      autoForcedReason.value = ''
       me.screenOn = true
       activeScreenPeerId.value = 'me'
       broadcastState()
@@ -1533,6 +1554,19 @@ export function useRoom(roomId, opts = {}) {
     for (let i = 0; i < u8.byteLength; i++) s += String.fromCharCode(u8[i])
     return btoa(s)
   }
+  // WT send stats — surfaced in the console every second so you can tell
+  // whether a bad share is send-side (WT drops) or receive-side.
+  const wtSendStats = { ok: 0, fail: 0, lastLogAt: 0 }
+  function logWtStats(now) {
+    if (now - wtSendStats.lastLogAt < 1000) return
+    if (wtSendStats.ok || wtSendStats.fail) {
+      const failPct = Math.round(100 * wtSendStats.fail / (wtSendStats.ok + wtSendStats.fail))
+      console.log(`[wt] send ok=${wtSendStats.ok} fail=${wtSendStats.fail} (${failPct}% loss)`)
+      wtSendStats.ok = 0
+      wtSendStats.fail = 0
+    }
+    wtSendStats.lastLogAt = now
+  }
   function sendVideo(msg) {
     if (useWtNow()) {
       const meta = { type: msg.type }
@@ -1544,7 +1578,24 @@ export function useRoom(roomId, opts = {}) {
           description: msg.config.description ? bytesToB64(msg.config.description) : ''
         }
       }
-      wt.value.sendChunk(WT_KIND.VIDEO, msg.ts, meta, new Uint8Array(msg.data))
+      // sendChunk resolves to a boolean (true = sent, false = failed).
+      // If it fails we IMMEDIATELY re-send the same chunk over socket.io so
+      // the viewer doesn't miss a frame just because one QUIC stream flopped.
+      // This is especially important for keyframes — losing a keyframe leaves
+      // the viewer stuck on a stale image until the next 20-s natural key.
+      wt.value.sendChunk(WT_KIND.VIDEO, msg.ts, meta, new Uint8Array(msg.data)).then((ok) => {
+        const now = performance.now()
+        if (ok) wtSendStats.ok++
+        else {
+          wtSendStats.fail++
+          if (socket?.connected) socket.emit('video', msg)
+        }
+        logWtStats(now)
+      }).catch(() => {
+        wtSendStats.fail++
+        if (socket?.connected) socket.emit('video', msg)
+        logWtStats(performance.now())
+      })
       return
     }
     if (socket?.connected) socket.emit('video', msg)
@@ -1557,7 +1608,11 @@ export function useRoom(roomId, opts = {}) {
         channels: msg.channels
       }
       if (msg.description) meta.description = bytesToB64(msg.description)
-      wt.value.sendChunk(WT_KIND.SCREEN_AUDIO, msg.ts, meta, new Uint8Array(msg.data))
+      wt.value.sendChunk(WT_KIND.SCREEN_AUDIO, msg.ts, meta, new Uint8Array(msg.data)).then((ok) => {
+        if (!ok && socket?.connected) socket.emit('screen-audio', msg)
+      }).catch(() => {
+        if (socket?.connected) socket.emit('screen-audio', msg)
+      })
       return
     }
     if (socket?.connected) socket.emit('screen-audio', msg)
@@ -1829,11 +1884,18 @@ export function useRoom(roomId, opts = {}) {
     // switch to plain socket.io. We drop out of WT for the rest of this share.
     // A fresh screen-share start clears autoForcedTcp so the next attempt
     // gets to try WT again.
+    // Honoured only when preferTransport === 'auto'. If the user explicitly
+    // demanded WT (for debugging) or already TCP, this is a no-op.
     socket.on('need-tcp', () => {
       if (!me.screenOn) return
+      if (preferTransport.value !== 'auto') {
+        console.warn('[transport] viewer asked for TCP but user preference is', preferTransport.value, '— ignoring')
+        return
+      }
       if (autoForcedTcp.value) return
       console.warn('[transport] viewer requested TCP fallback — disabling WT for this share')
       autoForcedTcp.value = true
+      autoForcedReason.value = '观看端 3.5s 未收到帧 · 自动切 TCP'
       vForceKey = true
     })
 
@@ -1936,7 +1998,14 @@ export function useRoom(roomId, opts = {}) {
   // no frames from them for a while, ask them to fall back to TCP. Fires at
   // most once per stall — reset when frames start flowing again, or when the
   // sharer stops sharing.
-  const STALL_MS = 3500                    // no-frame threshold before nagging
+  //   FIRST_FRAME_GRACE_MS: extra warmup for the initial frame. codec probing
+  //     (~15 nope's), encoder configure, first-keyframe emit and WT stream
+  //     setup all happen in this window. Nagging inside that would fire even
+  //     on a perfectly healthy WT link, which is what was happening in the
+  //     "chosen avc1.42E028 → viewer requested TCP fallback" log.
+  //   STALL_MS: gap allowed once frames HAVE been flowing.
+  const FIRST_FRAME_GRACE_MS = 7000
+  const STALL_MS = 3500
   const NAG_COOLDOWN_MS = 8000             // don't spam need-tcp
   const stallState = new Map()             // peerId -> { firstStallAt, lastNagAt }
   const stallTimer = setInterval(() => {
@@ -1946,11 +2015,13 @@ export function useRoom(roomId, opts = {}) {
       if (!p.screenOn) { stallState.delete(p.id); continue }
       const last = p.lastFrameTs || 0
       // Never received a frame → measure gap from when screenOn flipped on.
+      // First-frame grace is bigger than steady-state STALL_MS to cover
+      // encoder warmup + codec probe.
       if (!last) {
         const startedAt = p.screenOnAt || now
         const s = stallState.get(p.id) || { firstStallAt: startedAt, lastNagAt: 0 }
         stallState.set(p.id, s)
-        if (now - s.firstStallAt > STALL_MS && now - s.lastNagAt > NAG_COOLDOWN_MS) {
+        if (now - s.firstStallAt > FIRST_FRAME_GRACE_MS && now - s.lastNagAt > NAG_COOLDOWN_MS) {
           console.warn('[transport] no frames from', p.id.slice(0, 6), '— asking sharer to switch to TCP')
           socket.emit('need-tcp')
           s.lastNagAt = now
@@ -2005,8 +2076,9 @@ export function useRoom(roomId, opts = {}) {
     isSecure: IS_SECURE,
     senderTransport,          // 'wt' | 'socket' | 'tcp-forced' | 'tcp-auto' — reactive
     hasWebTransport: HAS_WEBTRANSPORT,
-    preferTransport,          // ref: 'auto' | 'tcp' — user's manual preference (persisted)
+    preferTransport,          // ref: 'auto' | 'tcp' | 'wt' — user's preference (persisted)
     autoForcedTcp,            // ref: session-only auto fallback flag
+    autoForcedReason,         // ref: human-readable reason for the fallback
     toggleMic,
     toggleScreen,
     toggleDenoise,

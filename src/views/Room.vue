@@ -59,33 +59,51 @@ function cancelRename() {
   renaming.value = false
 }
 
-// Transport chip — click cycles user preference between AUTO ↔ TCP.
-// Reflects senderTransport (which combines preference + healthy? + auto-forced).
+// Transport chip — click cycles user preference AUTO → TCP → WT → AUTO.
+//   AUTO: WT when healthy, auto-fallback to TCP on stall (default)
+//   TCP:  never use WT
+//   WT:   always use WT, ignore observers' TCP requests (debug mode)
 const transportLabel = computed(() => {
   switch (room.senderTransport.value) {
-    case 'wt':         return 'QUIC'
-    case 'socket':     return 'TCP'
-    case 'tcp-auto':   return 'TCP · 自动'
-    case 'tcp-forced': return 'TCP · 强制'
-    default:           return 'TCP'
+    case 'wt':          return 'QUIC'
+    case 'wt-degraded': return 'QUIC · 无连接'
+    case 'socket':      return 'TCP'
+    case 'tcp-auto':    return 'TCP · 自动'
+    case 'tcp-forced':  return 'TCP · 强制'
+    default:            return 'TCP'
   }
 })
 const transportClass = computed(() => {
   const t = room.senderTransport.value
   if (t === 'wt') return 'tp-wt'
+  if (t === 'wt-degraded') return 'tp-auto'
   if (t === 'tcp-auto') return 'tp-auto'
   return 'tp-tcp'
 })
-const transportForcedByUser = computed(() => room.preferTransport.value === 'tcp')
+const transportForcedByUser = computed(() => room.preferTransport.value !== 'auto')
 const transportTitle = computed(() => {
+  const pref = room.preferTransport.value
   const t = room.senderTransport.value
-  if (t === 'wt') return '当前 QUIC / WebTransport · 点击强制切 TCP'
-  if (t === 'tcp-forced') return '你手动强制了 TCP · 点击恢复 AUTO'
-  if (t === 'tcp-auto') return '自动降级至 TCP（观看端反馈 QUIC 丢包）· 点击切换偏好'
-  return '当前 TCP · 点击切换偏好'
+  const reason = room.autoForcedReason.value
+  const prefLine =
+    pref === 'wt'  ? '偏好：强制 QUIC（关自动 fallback，调试用）'
+    : pref === 'tcp' ? '偏好：强制 TCP'
+    : '偏好：AUTO（QUIC 健康时用 QUIC，观看端反馈丢帧就切 TCP）'
+  const nowLine = `当前实际：${
+    t === 'wt' ? 'QUIC / WebTransport'
+    : t === 'wt-degraded' ? 'QUIC session 未健康 → 实走 TCP'
+    : t === 'tcp-forced' ? 'TCP（你强制）'
+    : t === 'tcp-auto' ? `TCP（自动降级${reason ? ' · ' + reason : ''}）`
+    : 'TCP'
+  }`
+  return `${prefLine}\n${nowLine}\n点击切换：AUTO → TCP → WT`
 })
 function toggleTransport() {
-  room.preferTransport.value = room.preferTransport.value === 'tcp' ? 'auto' : 'tcp'
+  const cur = room.preferTransport.value
+  room.preferTransport.value =
+    cur === 'auto' ? 'tcp'
+    : cur === 'tcp' ? 'wt'
+    : 'auto'
 }
 
 const chatInput = ref('')
