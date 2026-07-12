@@ -300,6 +300,13 @@ io.on('connection', (socket) => {
     socket.to(currentRoom).emit('codec-string-unsupported', { codec })
   })
 
+  // Client wants a fresh WT token (theirs expired). Reissue and hand back.
+  socket.on('need-wt-token', () => {
+    if (!currentRoom || !wt) return
+    const { token, url } = wt.issueToken(socket.id, currentRoom)
+    socket.emit('webtransport', { url, token })
+  })
+
   // Sharer telling viewers which transport (wt / tcp) they're using. Relayed
   // so viewers can render a "分享者使用 UDP · 画面可能撕裂" banner.
   socket.on('sharer-transport', (payload) => {

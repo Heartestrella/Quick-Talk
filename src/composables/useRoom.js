@@ -1757,8 +1757,14 @@ export function useRoom(roomId, opts = {}) {
       wtRetryTimer = null
       if (preferTransport.value !== 'wt') return
       if (wt.value) return
-      if (!wtInfo) return
-      tryOpenWebTransport(wtInfo).catch(() => {})
+      // Ask the server for a fresh WT token — the one we cached in wtInfo
+      // has a 30 s TTL on the server side, so it's stale by now. Server
+      // replies with `webtransport` event which our handler will use to
+      // retry IF preferTransport is still 'wt'.
+      if (socket?.connected) socket.emit('need-wt-token')
+      // Also try with the current cached token — cheap, and if the server
+      // is slow to respond we still make an attempt.
+      if (wtInfo) tryOpenWebTransport(wtInfo).catch(() => {})
     }, delayMs)
   }
   async function tryOpenWebTransport(info) {
@@ -2026,9 +2032,15 @@ export function useRoom(roomId, opts = {}) {
 
     // Server hands us a WT URL + short-lived token right after join, IF it has
     // a WT relay configured. Missing/absent → we just stay on socket.io.
+    //
+    // We STASH the info but only actually open the QUIC session when the user
+    // has opted into UDP (preferTransport === 'wt'). Otherwise we'd flood the
+    // console with `ERR_TUNNEL_CONNECTION_FAILED` on every setup where the
+    // operator's tunnel / firewall doesn't forward UDP 4433 — data flows over
+    // socket.io fine, but the noisy failure log makes it look broken.
     socket.on('webtransport', (info) => {
       wtInfo = info
-      tryOpenWebTransport(info)
+      if (preferTransport.value === 'wt') tryOpenWebTransport(info)
     })
     socket.on('need-codec', ({ wanted, avoidString }) => {
       if (!me.screenOn) return
