@@ -2200,11 +2200,15 @@ export function useRoom(roomId, opts = {}) {
     return false
   })
 
-  // Any active sharer currently on WT/UDP → all room members show the
-  // "画面可能撕裂" banner. Self's mode is preferTransport; peers' is
-  // whatever they last broadcast via `sharer-transport`.
+  // Persistent UDP warning banner. Shown to the local user whenever THEY've
+  // selected UDP (whether or not they're currently sharing — the moment they
+  // start sharing it'll go UDP, so warn ahead of time), and shown to viewers
+  // whenever any active sharer they can see is on UDP. Previously we
+  // gated the sharer's own banner on `me.screenOn` too — that made the
+  // banner blink off if screen sharing wasn't active for a moment, which
+  // read as "the warning auto-closes after 3 s".
   const anySharerOnUdp = computed(() => {
-    if (me.screenOn && preferTransport.value === 'wt') return true
+    if (preferTransport.value === 'wt') return true
     for (const p of peers.values()) {
       if (!p.screenOn) continue
       if (peerTransportMode.get(p.id) === 'wt') return true

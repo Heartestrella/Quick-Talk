@@ -522,14 +522,14 @@ onUnmounted(() => {
         </div>
       </transition>
 
-      <!-- UDP tearing warning — shown to EVERYONE (sharer + all viewers)
-           whenever any active sharer picked UDP. Persists until they switch
-           back or stop sharing. -->
+      <!-- UDP tearing warning — persistent while the local user's transport
+           is UDP OR any peer they can see is sharing over UDP. Independent
+           of whether anyone is currently sharing so it doesn't blink off. -->
       <div v-if="room.anySharerOnUdp.value" class="disconnect-banner udp-banner">
         <span class="dc-dot udp" aria-hidden="true"></span>
         <span class="dc-text">
           <span class="mono udp-tag">UDP</span>
-          分享者使用 UDP / QUIC 传输 · 画面可能撕裂或残留
+          UDP / QUIC 模式 · 屏幕共享画面可能撕裂或残留
         </span>
       </div>
 
